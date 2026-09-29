@@ -34,6 +34,8 @@ const NET_ERROR = /^net::ERR_(INTERNET_DISCONNECTED|NETWORK_CHANGED|NETWORK_IO_S
 
 const COLORS = { rec: "#2E7A22", ink: "#23241E" };
 
+importScripts("ai.js"); // the AI check (AI settings on the options page)
+
 // ---------- state ----------
 
 const tabs = new Map(); // tabId -> persisted state
@@ -191,6 +193,8 @@ function snapshot(tabId) {
     startUrl: t.tape.startUrl,
     linked: t.mode === "idle" ? tapeTabs(t.tape).length : group.length,
     slot: Math.max(0, group.indexOf(tabId)),
+    ai: aiLabel(), // the AI check's model, "" when it's off
+    aiAfter: aiConfig.stuckAfter,
   };
 }
 
@@ -228,6 +232,12 @@ function sendWithTimeout(tabId, msg, ms) {
       }
     );
   });
+}
+
+// p, or a rejection after ms. For calls a frozen page can hold up for good.
+function within(p, ms) {
+  let timer;
+  return Promise.race([p, new Promise((_, no) => (timer = setTimeout(() => no(new Error("timeout")), ms)))]).finally(() => clearTimeout(timer));
 }
 
 function markReady(tabId) {
@@ -297,8 +307,8 @@ async function ensureContent(tabId) {
     if (pong && pong.ok) return true;
   } catch (_) {}
   try {
-    await chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: ["content/clipboard-main.js"], world: "MAIN" }).catch(() => {});
-    await chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: CONTENT_FILES });
+    await within(chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: ["content/clipboard-main.js"], world: "MAIN" }), 10000).catch(() => {});
+    await within(chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: CONTENT_FILES }), 10000);
     return true;
   } catch (_) {
     return false;
@@ -606,11 +616,9 @@ const awakeTabs = new Set();
 
 async function keepAwake(tabId) {
   try {
-    if (!awakeTabs.has(tabId)) {
-      await chrome.debugger.attach({ tabId }, "1.3");
-      awakeTabs.add(tabId);
-    }
-    await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true });
+    // A frozen page can hold these up for good: go on without them.
+    if (!awakeTabs.has(tabId)) await within(chrome.debugger.attach({ tabId }, "1.3").then(() => awakeTabs.add(tabId)), 5000);
+    await within(chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true }), 5000);
   } catch (_) {
     // DevTools already open, or a page Chrome protects. Playback still runs.
   }
@@ -710,7 +718,7 @@ async function osClipWrite(text, tabId) {
 // Adds the newest clipboard helper to a tab's page, replacing an older one
 // left from before an extension update. Safe to repeat.
 function freshHook(tabId) {
-  return chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: ["content/clipboard-main.js"], world: "MAIN" }).catch(() => {});
+  return within(chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: ["content/clipboard-main.js"], world: "MAIN" }), 5000).catch(() => {});
 }
 
 function waitClip(ctl, seq, ms) {
@@ -887,6 +895,7 @@ async function performStepOnce(tabId, ctl, msg) {
   }
   for (let attempt = 0; attempt < 4; attempt++) {
     if (ctl.cancelled) return { ok: true };
+    if (ctl.kick) return kickedResult(ctl);
     if (navPending.get(tabId)) {
       const ok = await waitReady(tabId, READY_TIMEOUT, ctl);
       if (!ok && !ctl.cancelled) return { ok: false, error: "The page did not finish loading" };
@@ -894,13 +903,18 @@ async function performStepOnce(tabId, ctl, msg) {
     }
     if (netErrors.has(tabId)) return offline(tabId);
     ctl.acted = -1;
+    const kicked = kickWait(ctl);
     try {
-      const res = await sendWithTimeout(tabId, msg, performTimeout(msg));
+      // The AI check can give up on a step while the page still waits for it.
+      const res = await Promise.race([sendWithTimeout(tabId, msg, performTimeout(msg)), kicked]);
       if (res) return res;
     } catch (e) {
       if (ctl.acted === msg.i) return { ok: true, x: null };
       if (String(e && e.message) === "timeout") return { ok: false, error: "The page stopped responding" };
+    } finally {
+      kicked.off();
     }
+    if (ctl.kick) return kickedResult(ctl);
     // No listener: the page is still loading or was replaced. Wait for it.
     if (ctl.acted === msg.i) return { ok: true, x: null };
     if (netErrors.has(tabId)) return offline(tabId);
@@ -935,6 +949,7 @@ const say = (lead, text) => {
 // READY_TIMEOUT. False when the page can't be brought back.
 async function reloadStuck(lead, id, ctl) {
   say(lead, "The page seems stuck. Reloading it");
+  await unfreeze(id);
   await navigate(id, ctl, { kind: "reload" }).catch(() => false);
   if (!ctl.cancelled && navPending.get(id)) {
     say(lead, "Waiting for the page to load");
@@ -945,6 +960,14 @@ async function reloadStuck(lead, id, ctl) {
   const ok = await ensureContent(id);
   say(lead, "");
   return ok;
+}
+
+// A page caught in an endless script can't be left: Chrome waits for it
+// before loading the next page. Stops the script that runs now, through the
+// debugger connection that keeps playing tabs awake. Harmless when none runs.
+async function unfreeze(id) {
+  if (!awakeTabs.has(id)) return;
+  await Promise.race([chrome.debugger.sendCommand({ tabId: id }, "Runtime.terminateExecution").catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);
 }
 
 // Reloads a tab showing Chrome's error page until a real page loads. Waits as
@@ -1107,6 +1130,190 @@ async function signOutFirst(lead, ctl, t, group, steps, only = null) {
   return pressed;
 }
 
+// ---------- AI check ----------
+// With an AI model set up (options page) and "Recover on its own" on, a step
+// that has waited aiConfig.stuckAfter seconds gets looked at every
+// aiConfig.every seconds. TinyTab sends the model the page in words (see
+// ai.js) and acts on the answer:
+//   a signed-in home screen: log out, then play again from step 1;
+//   the start page or a sign-in form in the middle of a run: play again from step 1;
+//   stuck (frozen, blank, an error, endless loading) or another page (a
+//   promotion, an anniversary page): reload it, go on from the step that fits;
+//   the same step stuck again after that reload: play again from step 1.
+// A step whose element is on the page and usable is left alone: the player is
+// about to do it. A page that doesn't answer TinyTab at all counts as stuck.
+
+const AI_SEES = {
+  expected: "the page the step needs",
+  start: "the start page",
+  home: "a signed-in home screen",
+  login: "a sign-in page",
+  error: "an error page",
+  blank: "a blank page",
+  loading: "a page stuck loading",
+  other: "a different page",
+};
+
+const aiSummary = (a) =>
+  `page ${a.page}${a.stuck ? ", stuck" : ""}${a.signedIn ? ", signed in" : ""}${a.atStart ? ", at the start" : ""}${a.reason ? `: ${a.reason}` : ""}`;
+
+// A step for the AI, in words. Never what the step types.
+function stepText(st) {
+  if (!st) return "";
+  const t = st.target || {};
+  const a = t.attrs || {};
+  const name = String(t.text || a["aria-label"] || a.placeholder || a.name || a.title || "").slice(0, 60);
+  const kind = { a: "link", button: "button", input: "field", textarea: "text box", select: "menu", img: "image" }[t.tag] || t.tag || "element";
+  const what = name ? `the "${name}" ${kind}` : `a ${kind}`;
+  switch (st.type) {
+    case "click": return `click ${what}`;
+    case "dbl": return `double-click ${what}`;
+    case "rclick": return `right-click ${what}`;
+    case "input": return `type into ${what}`;
+    case "key": return `press ${st.key || "a key"}`;
+    case "copy": return `copy the text of ${what}`;
+    case "paste": return `paste into ${what}`;
+    case "hover": return `point at ${what}`;
+    case "scroll": return "scroll";
+    case "nav": return st.kind === "reload" ? "reload the page" : `open ${pageOf(st.url) || "a page"}`;
+  }
+  return st.type;
+}
+
+// What the tab shows, in words (content/sense.js). null when the page doesn't answer.
+async function tabSnapshot(id) {
+  const r = await sendWithTimeout(id, { type: "snapshot" }, 5000).catch(() => null);
+  return r && r.ok && r.snap ? r.snap : null;
+}
+
+// Whether a recorded element is on the page now, visible and usable.
+async function probeOne(id, target) {
+  const r = await sendWithTimeout(id, { type: "probe", targets: [target], sure: [false] }, 5000).catch(() => null);
+  return !!(r && Array.isArray(r.found) && r.found[0]);
+}
+
+// What the AI gets to know about the task, for step i.
+function aiJob(t, i, snap, question) {
+  const steps = t.tape.steps;
+  const st = steps[i];
+  const slot = st.tab || 0;
+  const first = steps.findIndex((x) => (x.tab || 0) === slot && x.type !== "path");
+  const start = (tapeTabs(t.tape)[slot] || {}).startUrl || "";
+  return {
+    question,
+    recordingStartedOn: pageOf(start) || start,
+    firstStep: first >= 0 ? stepText(steps[first]) : "",
+    previousStep: i > 0 ? stepText(steps[i - 1]) : "",
+    waitingFor: { step: i + 1, of: steps.length, action: stepText(st), recordedOn: st.page || "" },
+    tabIsOnThatPage: !!(snap && st.page && snap.url === st.page),
+  };
+}
+
+// A result for a step the AI check gave up on.
+function kickedResult(ctl) {
+  return { ok: false, kicked: true, error: (ctl.kick && ctl.kick.why) || "stopped by the AI check" };
+}
+
+// Resolves when the AI check gives up on the current step. off() forgets it.
+function kickWait(ctl) {
+  let fn = null;
+  const p = new Promise((resolve) => {
+    fn = () => resolve(kickedResult(ctl));
+    if (ctl.kick) fn();
+    else ctl.kickers.add(fn);
+  });
+  p.off = () => ctl.kickers.delete(fn);
+  return p;
+}
+
+function kick(ctl, verdict) {
+  ctl.kick = verdict;
+  for (const fn of [...ctl.kickers]) fn();
+  // Waits for a page load or a copy end now, so playback sees the verdict.
+  for (const fn of [...ctl.wakers]) fn(false);
+}
+
+// The verdict on step i, waiting in tab id for ms: null to leave it be, or
+// { action: "logout" | "restart" | "refresh", why }.
+async function aiJudge(lead, ctl, t, i, id, ms) {
+  const steps = t.tape.steps;
+  const st = steps[i];
+  const secs = Math.round(ms / 1000);
+  const refresh = (why) => (ctl.aiReloads.get(i) ? { action: "restart", why: `${why}, again after a reload` } : { action: "refresh", why });
+  // Chrome's error page: the usual recovery reloads it once the connection is back.
+  if (netErrors.has(id)) return null;
+  // A new page still loading gets READY_TIMEOUT, as usual. Until it shows, the
+  // old page would answer for it.
+  if (navPending.get(id) && ms < READY_TIMEOUT) return null;
+  // The element is there and usable: the player is about to do the step.
+  if (st.target && (await probeOne(id, st.target))) return null;
+  const snap = await tabSnapshot(id);
+  if (ctl.cancelled) return null;
+  const shot = await aiShot(id, awakeTabs.has(id));
+  if (!snap && !shot) {
+    // No answer from the page: frozen, or its load never ended.
+    log(`  AI check, step ${i + 1}: the page hasn't answered for ${secs} s`);
+    return refresh(`the page hasn't answered for ${secs} s`);
+  }
+  say(lead, "Asking the AI what the page shows");
+  const a = await aiAsk(snap, aiJob(t, i, snap, `TinyTab has waited ${secs} s to do step ${i + 1}. Which page is this, and is it stuck?`), shot).finally(() => say(lead, ""));
+  log(`  AI on step ${i + 1} after ${secs} s: ${aiSummary(a)}`);
+  if (a.page === "expected" && !a.stuck) return null;
+  const why = `the AI sees ${AI_SEES[a.page]}${a.stuck && a.page === "expected" ? ", stuck" : ""}${a.reason ? ` (${a.reason})` : ""}`;
+  if (a.page === "home" && a.signedIn) return { action: "logout", why };
+  if ((a.page === "start" || a.page === "login") && !a.stuck) {
+    // Back where the tab began, in the middle of the run: start over. Still
+    // on this tab's first step: that's where it should be.
+    const first = steps.findIndex((x) => (x.tab || 0) === (st.tab || 0) && x.type !== "path");
+    return i > first ? { action: "restart", why } : null;
+  }
+  return refresh(why);
+}
+
+// Runs beside one playback until it ends: looks at the step that waits too long.
+async function aiWatch(lead, ctl, t) {
+  await aiLoaded;
+  const over = () => ctl.cancelled || ctl.over;
+  while (!over()) {
+    await sleep(aiConfig.every * 1000, ctl);
+    const cur = ctl.cur;
+    if (over() || !cur || ctl.kick || !aiUsable() || t.settings.recover === false) continue;
+    const ms = Date.now() - cur.since;
+    if (ms < aiConfig.stuckAfter * 1000) continue;
+    let verdict = null;
+    try {
+      verdict = await aiJudge(lead, ctl, t, cur.i, cur.id, ms);
+    } catch (e) {
+      const text = `AI check failed: ${(e && e.message) || e}`;
+      if (ctl.aiWarned) log(`  ${text}`);
+      else sendGroup(lead, { type: "warn", text }); // once per Play; the log gets the rest
+      ctl.aiWarned = true;
+    }
+    // The step went on, or failed by itself, while the AI thought: nothing to do.
+    if (verdict && !over() && ctl.cur === cur) kick(ctl, verdict);
+  }
+}
+
+// At the start of a run, when the tab's first step is on the page: whether
+// the AI sees the tab still signed in from an earlier run all the same.
+async function aiSignedInAtStart(lead, ctl, t, s, k, id) {
+  if (!aiUsable()) return false;
+  try {
+    const snap = await tabSnapshot(id);
+    if (!snap || ctl.cancelled) return false;
+    say(lead, "Asking the AI whether the tab is at the start");
+    const question = "The run is about to start. Is this tab at the start of the recording, or still signed in from an earlier run?";
+    const a = await aiAsk(snap, aiJob(t, k, snap, question), await aiShot(id, awakeTabs.has(id)));
+    log(`  AI at the start of tab ${s + 1}: ${aiSummary(a)}`);
+    return a.signedIn && !a.atStart && a.page !== "start" && a.page !== "expected";
+  } catch (e) {
+    log(`  AI check failed: ${(e && e.message) || e}`);
+    return false;
+  } finally {
+    say(lead, "");
+  }
+}
+
 // ---------- the start of each run ----------
 // Every run should begin where the recording began. For each tab, if the
 // first thing the tape does there isn't on its start page (still signed in,
@@ -1147,14 +1354,19 @@ async function ensureStartState(lead, ctl, t, group, slots, steps) {
     }
     if (k < 0) continue;
     const id = group[s];
-    if (await here(id, k, START_WAIT_MS)) continue;
-    const what = steps[k].target.text ? `"${steps[k].target.text.slice(0, 40)}"` : "its first button or field";
-    sendGroup(lead, { type: "warn", text: `Tab ${s + 1} doesn't look like the start of the recording (${what} isn't there). Resetting it.` });
-    // A popup in the way?
-    const r0 = await sendWithTimeout(id, { type: "unblock" }, 15000).catch(() => null);
-    if (r0 && r0.done && r0.done.length) {
-      log(`  Closed a popup: ${r0.done.join(", ")}`);
-      if (await here(id, k, 3000)) continue;
+    if (await here(id, k, START_WAIT_MS)) {
+      // The first step's element can show on a signed-in home page too.
+      if (!(await aiSignedInAtStart(lead, ctl, t, s, k, id))) continue;
+      sendGroup(lead, { type: "warn", text: `Tab ${s + 1}: the AI sees it still signed in, not at the start of the recording. Logging out.` });
+    } else {
+      const what = steps[k].target.text ? `"${steps[k].target.text.slice(0, 40)}"` : "its first button or field";
+      sendGroup(lead, { type: "warn", text: `Tab ${s + 1} doesn't look like the start of the recording (${what} isn't there). Resetting it.` });
+      // A popup in the way?
+      const r0 = await sendWithTimeout(id, { type: "unblock" }, 15000).catch(() => null);
+      if (r0 && r0.done && r0.done.length) {
+        log(`  Closed a popup: ${r0.done.join(", ")}`);
+        if (await here(id, k, 3000)) continue;
+      }
     }
     // 1. Log out, the tape's way first, then any way the page offers.
     say(lead, "Logging out before starting");
@@ -1273,10 +1485,17 @@ async function startPlayback(tabId, resumed, again = null) {
     clip: null, clipSeq: 0, clipWaiters: new Set(), clipWrite: null, group: [tabId],
     again: !!again, // load the start pages afresh before step 1
     tries: new Map(), // step index -> recoveries at that step in this run
+    // The AI check (see aiWatch): the step being done, the check's verdict on it.
+    cur: null, // { i, id, since }
+    kick: null, // { action, why }
+    kickers: new Set(),
+    aiReloads: new Map(), // step index -> reloads the AI check asked for in this run
+    over: false, // playback ended
   };
   players.set(tabId, ctl);
 
   const t = getTab(tabId);
+  aiWatch(tabId, ctl, t).catch((e) => log(`AI check stopped: ${(e && e.message) || e}`));
   t.mode = "playing";
   t.error = "";
   let error = "";
@@ -1428,6 +1647,38 @@ async function startPlayback(tabId, resumed, again = null) {
       }
       return goTo;
     };
+    // Acts on the AI check's verdict on step i (see aiJudge). Decides goTo, as recover does.
+    const onKick = async (i, id) => {
+      const k = ctl.kick;
+      ctl.kick = null;
+      send(id, { type: "abort" }).catch(() => {}); // the page stops waiting for the step
+      trouble = `Step ${i + 1}: ${k.why}`;
+      const next = { logout: "Logging out, then starting again.", restart: "Starting again from step 1.", refresh: "Reloading the page." }[k.action];
+      sendGroup(tabId, { type: "warn", text: `${trouble}. ${next}` });
+      if (k.action === "restart") return (goTo = -1);
+      if (k.action === "logout") {
+        say(tabId, "Logging out");
+        // The tape's own log out first, then any the page offers.
+        if (!(await signOutFirst(tabId, ctl, t, group, steps, steps[i].tab || 0)) && !ctl.cancelled) {
+          const r = await sendWithTimeout(id, { type: "signout" }, 20000).catch(() => null);
+          if (r && r.done) {
+            log(`  Pressed "${r.label}"${r.opened ? ` (in the "${r.opened}" menu)` : ""}`);
+            await sleep(2500, ctl);
+            if (navPending.get(id)) await waitReady(id, READY_TIMEOUT, ctl);
+          } else log("  Found no log out button on the page");
+        }
+        say(tabId, "");
+        return (goTo = -1); // the start check clears the site's data if still signed in
+      }
+      // refresh
+      ctl.aiReloads.set(i, (ctl.aiReloads.get(i) || 0) + 1);
+      ctl.shakyUntil = Math.max(ctl.shakyUntil || -1, i);
+      if (!(await reloadStuck(tabId, id, ctl))) return (goTo = -1);
+      say(tabId, "Finding the place in the recording");
+      goTo = await findPlace(steps, i, id, ctl);
+      say(tabId, "");
+      return goTo;
+    };
 
     while (!ctl.cancelled && t.play.run <= runs()) {
       if (t.play.index === 0) {
@@ -1443,6 +1694,7 @@ async function startPlayback(tabId, resumed, again = null) {
           if (navPending.get(id)) await waitReady(id, READY_TIMEOUT, ctl);
           if (ctl.again) {
             // Played again after a stuck page: load every start page afresh.
+            await unfreeze(id);
             await navigate(id, ctl, web ? { kind: "goto", url } : { kind: "reload" }).catch(() => false);
             continue;
           }
@@ -1517,13 +1769,15 @@ async function startPlayback(tabId, resumed, again = null) {
           clip: ctl.clip,
           settings: t.settings,
         };
+        ctl.kick = null; // a verdict on an earlier step
+        ctl.cur = { i, id: target, since: Date.now() };
         let res = await performStep(target, ctl, msg);
         if (res && res.ok && typeof res.copied === "string" && res.copied) setClip(ctl, res.copied, target);
-        if (res && res.ok && (step.copies || step.type === "copy") && !ctl.cancelled) {
+        if (res && res.ok && (step.copies || step.type === "copy") && !ctl.cancelled && !ctl.kick) {
           // Wait for the site's Copy button to copy. A page still loading its text
           // copies nothing yet, so try the click again a few times.
           let got = await waitClip(ctl, seq0, 1200);
-          for (let r = 0; !got && r < 25 && !ctl.cancelled; r++) {
+          for (let r = 0; !got && r < 25 && !ctl.cancelled && !ctl.kick; r++) {
             await sleep(500, ctl);
             res = await performStep(target, ctl, { ...msg, lead: 0 });
             if (!res || !res.ok) break;
@@ -1534,7 +1788,12 @@ async function startPlayback(tabId, resumed, again = null) {
           // The next step may click a box that reads the clipboard at once.
           if (got && ctl.clipWrite) await ctl.clipWrite;
         }
+        ctl.cur = null;
         if (ctl.cancelled) break;
+        if (ctl.kick) {
+          await onKick(i, target);
+          break;
+        }
         if (res && res.x != null) last.set(target, { x: res.x, y: res.y });
         if (res && "hidden" in res) hidden.set(target, !!res.hidden);
         if (res && res.hidden && speed !== Infinity) {
@@ -1579,6 +1838,7 @@ async function startPlayback(tabId, resumed, again = null) {
       }
       t.restarts = 0; // a whole run went through
       ctl.tries.clear();
+      ctl.aiReloads.clear();
       t.play.index = 0;
       t.play.run += 1;
       persist(tabId);
@@ -1587,11 +1847,16 @@ async function startPlayback(tabId, resumed, again = null) {
   } catch (e) {
     error = String((e && e.message) || e);
   } finally {
+    ctl.over = true; // ends aiWatch
+    for (const fn of [...ctl.wakers]) fn(false);
     for (const id of group) send(id, { type: "clip", text: null }).catch(() => {});
     if (players.get(tabId) === ctl) {
       players.delete(tabId);
+      // Playing again soon: the tabs stay connected. A frozen page can't be
+      // connected to again, and the connection is what unfreezes it.
+      const again = !!replay && !error && !ctl.cancelled;
       for (const id of group) {
-        letSleep(id);
+        if (!again) letSleep(id);
         chrome.tabs.update(id, { autoDiscardable: true }).catch(() => {});
         if (id !== tabId && !ctl.cancelled) releaseMember(id);
       }
@@ -1614,12 +1879,14 @@ async function startPlayback(tabId, resumed, again = null) {
 // at step 1 (the run count carries on). No limit; the wait grows when it
 // keeps happening, and resets once a whole run goes through.
 
-function cancelReplay(tabId) {
+function cancelReplay(tabId, sleepTabs = true) {
   const w = replays.get(tabId);
   if (!w) return;
   replays.delete(tabId);
   w.cancelled = true;
   for (const fn of [...w.wakers]) fn();
+  // The tabs stayed awake for a Play that isn't coming now.
+  if (sleepTabs) for (const id of w.group) if (!players.has(leaderOf(id))) letSleep(id);
 }
 
 // Schedules the Play; returns the note the panel shows until it starts.
@@ -1627,15 +1894,18 @@ function playAgainLater(tabId, group, { why, run }) {
   const t = tabs.get(tabId);
   t.restarts = (t.restarts || 0) + 1;
   const ms = t.restarts <= 3 ? 3000 : t.restarts <= 6 ? 15000 : 60000;
-  const w = { cancelled: false, wakers: new Set() };
-  cancelReplay(tabId);
+  const w = { cancelled: false, wakers: new Set(), group };
+  cancelReplay(tabId, false);
   replays.set(tabId, w);
   (async () => {
     await sleep(ms, w); // chunked, so the worker stays awake through the wait
     if (w.cancelled || replays.get(tabId) !== w) return;
     replays.delete(tabId);
     const now = tabs.get(tabId);
-    if (!now || !now.on || now.mode !== "idle" || !now.tape.steps.length) return;
+    if (!now || !now.on || now.mode !== "idle" || !now.tape.steps.length) {
+      for (const id of group) letSleep(id);
+      return;
+    }
     now.play = { index: 0, run };
     startPlayback(tabId, false, { group });
   })();
@@ -1682,6 +1952,7 @@ function applySettings(t, patch) {
 // ---------- message router ----------
 
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
+  if (msg && msg.target) return; // for the offscreen page or the AI check (ai.js)
   const tabId = sender.tab && sender.tab.id;
   if (tabId == null || sender.frameId !== 0) return;
   handle(tabId, msg, sender.tab.url).then(reply, (e) => reply({ ok: false, error: String((e && e.message) || e) }));
@@ -1800,6 +2071,9 @@ async function command(tabId, t, msg) {
     }
     case "getLog":
       return { ok: true, lines: logLines.slice() };
+    case "aiSettings":
+      await chrome.runtime.openOptionsPage();
+      break;
     case "getTape": {
       const tape = structuredClone(t.tape);
       for (const s of tape.steps) delete s.t0;
@@ -1813,6 +2087,14 @@ async function command(tabId, t, msg) {
   }
   return { ok: true };
 }
+
+// The AI check was set up or switched: the panels show it.
+chrome.storage.onChanged.addListener(async (changes, area) => {
+  if (area !== "local" || !changes.ai) return;
+  aiConfig = cleanAiConfig(changes.ai.newValue);
+  await ready;
+  for (const [id, t] of tabs) if (t.on) notify(id);
+});
 
 // ---------- cleanup ----------
 

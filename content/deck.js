@@ -177,6 +177,10 @@
           <label class="sw">Start each run like the recording<input type="checkbox" data-set="resetSession"><span class="track"></span></label>
           <div class="hint">If a site doesn't look like it did when you recorded (still signed in, say), log out or disconnect first. No button for it: clear that site's cookies and storage.</div>
         </div>
+        <div>
+          <div class="sw" style="cursor:default">AI check<button class="text-btn" data-act="ai">Set up</button></div>
+          <div class="hint ai-hint"></div>
+        </div>
         <div class="foot">
           <div class="keys">Alt+Shift+R record, Alt+Shift+P play<br>Alt+Shift+T on and off</div>
           <button class="text-btn" data-act="clear">Clear</button>
@@ -349,6 +353,8 @@
         return save();
       case "savelog":
         return saveLog();
+      case "ai":
+        return command("aiSettings");
       case "dismiss":
         hideMessage();
         return command("dismiss");
@@ -488,6 +494,10 @@
     if (root.activeElement !== rep) rep.value = st.repeat;
     rep.disabled = !!st.loop;
     root.querySelectorAll("[data-set]").forEach((c) => (c.checked = !!st[c.getAttribute("data-set")]));
+    $('[data-act="ai"]').textContent = s.ai ? "Settings" : "Set up";
+    $(".ai-hint").textContent = s.ai
+      ? `On, with ${s.ai}. A step stuck over ${s.aiAfter} s: asks it what the page shows, then logs out, reloads or starts again. Needs "Recover on its own".`
+      : "Off. An AI model (DeepSeek) looks at a stuck page and tells TinyTab to log out, reload or start again.";
 
     paintProgress();
     if (s.error) message(s.error, "error");

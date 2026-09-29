@@ -19,14 +19,20 @@
     if (!s.on) {
       TT.recorder.stop();
       TT.player.end();
+      TT.sense.unwatch();
       TT.deck.hide();
       return;
     }
     TT.deck.show(s);
     if (s.mode === "recording") TT.recorder.start(s.settings);
     else TT.recorder.stop();
-    if (s.mode === "playing") TT.player.begin(s.settings);
-    else TT.player.end();
+    if (s.mode === "playing") {
+      TT.player.begin(s.settings);
+      TT.sense.watch();
+    } else {
+      TT.player.end();
+      TT.sense.unwatch();
+    }
   }
 
   function teardown() {
@@ -34,6 +40,7 @@
     dead = true;
     TT.recorder.stop();
     TT.player.teardown();
+    TT.sense.unwatch();
     TT.deck.hide();
     try {
       chrome.runtime.onMessage.removeListener(onMessage);
@@ -90,6 +97,17 @@
       case "unblock":
         TT.sense.unblock().then((done) => reply({ ok: true, done }), () => reply({ ok: true, done: [] }));
         return true;
+      case "snapshot":
+        try {
+          reply({ ok: true, snap: TT.sense.snapshot() });
+        } catch (e) {
+          reply({ ok: false, error: String(e) });
+        }
+        return;
+      case "abort":
+        TT.player.abort();
+        reply({ ok: true });
+        return;
       case "clearSession":
         // Tab-only storage survives a reload; clearing site data doesn't reach it.
         try {

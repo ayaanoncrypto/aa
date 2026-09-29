@@ -795,6 +795,11 @@
       cursor.hide();
       shield.unmount();
     },
+    // Drop the step in progress (still waiting for its element, say): the
+    // service worker gave up on it and does something else.
+    abort() {
+      session++;
+    },
     perform: (msg) => {
       if (!playing) TT.player.begin(msg.settings);
       return perform(msg).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));

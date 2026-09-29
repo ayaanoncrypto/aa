@@ -2,7 +2,9 @@
 //   signOut()  find and press a log out / sign out / disconnect control,
 //              opening an account, profile or wallet menu to reach it.
 //   unblock()  close a popup, dialog or cookie banner that covers the page.
-// Rules only: nothing leaves the computer.
+//   snapshot() the page in words, for the AI check in the service worker.
+// Rules only: nothing leaves the computer from here. The service worker sends
+// a snapshot to the AI model only when the AI check is set up and on.
 (() => {
   if (globalThis.__tinytabBooted) return;
   const TT = globalThis.TinyTab;
@@ -174,5 +176,75 @@
     return done;
   }
 
-  TT.sense = { signOut, unblock, signOutControls, menuOpeners, SIGN_OUT };
+  // ---------- what the page shows (for the AI check) ----------
+
+  // When the page last changed. A page that stopped changing while TinyTab
+  // waits is frozen or done; one still changing is loading or animating.
+  let changedAt = 0;
+  let watcher = null;
+  const ours = (n) => n.nodeType === 1 && TT.HOST_TAGS.has(n.localName);
+  function watch() {
+    if (watcher) return;
+    changedAt = Date.now();
+    watcher = new MutationObserver((list) => {
+      for (const m of list) {
+        if (ours(m.target)) continue;
+        if (m.type === "childList" && [...m.addedNodes, ...m.removedNodes].every(ours)) continue;
+        changedAt = Date.now();
+        return;
+      }
+    });
+    watcher.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
+  }
+  function unwatch() {
+    if (watcher) watcher.disconnect();
+    watcher = null;
+  }
+
+  const LOADERS = '[aria-busy="true"], [role="progressbar"], progress, [class*="spinner" i], [class*="loading" i], [class*="loader" i], [class*="skeleton" i]';
+  const inViewport = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth;
+  };
+  // Up to max distinct names of the elements on screen that match sel.
+  function onScreen(sel, name, max) {
+    const out = [];
+    for (const el of document.querySelectorAll(sel)) {
+      if (out.length >= max) break;
+      if (!TT.isVisible(el) || !inViewport(el)) continue;
+      const v = name(el);
+      if (v && !out.includes(v)) out.push(v);
+    }
+    return out;
+  }
+  const controlName = (el) => (el.localName === "input" ? clean(el.value) : clean(el.innerText).slice(0, 50)) || hintOf(el);
+  const fieldName = (el) => {
+    const label = el.labels && el.labels[0] ? clean(el.labels[0].innerText) : "";
+    const name = clean(el.getAttribute("placeholder") || el.getAttribute("aria-label") || label || el.getAttribute("name") || "").slice(0, 50);
+    return `${name || "unnamed"} (${el.localName === "input" ? el.type || "text" : el.localName})`;
+  };
+
+  // The page in words: address without the query, title, the start of its
+  // text, and the names of what is on screen. Never what is typed in a field.
+  function snapshot() {
+    let loaders = 0;
+    for (const el of document.querySelectorAll(LOADERS)) {
+      if (TT.isVisible(el) && inViewport(el) && ++loaders >= 20) break;
+    }
+    return {
+      url: location.origin + location.pathname,
+      title: clean(document.title).slice(0, 150),
+      readyState: document.readyState,
+      quietSec: watcher ? Math.round((Date.now() - changedAt) / 1000) : null,
+      loaders,
+      headings: onScreen("h1, h2, h3", (el) => clean(el.innerText).slice(0, 80), 8),
+      text: clean(document.body ? document.body.innerText : "").slice(0, 1500),
+      controls: onScreen('button, a, [role="button"], [role="tab"], [role="menuitem"], input[type="submit"], input[type="button"]', controlName, 40),
+      fields: onScreen('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select', fieldName, 15),
+      dialogs: onScreen('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open]', (el) => clean(el.innerText).slice(0, 200), 3),
+      signOut: signOutControls().length > 0,
+    };
+  }
+
+  TT.sense = { signOut, unblock, signOutControls, menuOpeners, SIGN_OUT, snapshot, watch, unwatch };
 })();

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TinyTab AI check</title>
+<style>
+  :root {
+    --primary: #0B57D0; --on-primary: #fff; --text: #1F1F1F; --soft: #444746; --line: rgba(116, 119, 117, .5);
+    --bg: #F8FAFD; --card: #fff; --ok: #146C2E; --bad: #B3261E;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --primary: #A8C7FA; --on-primary: #062E6F; --text: #E3E3E3; --soft: #C4C7C5; --line: rgba(196, 199, 197, .35);
+      --bg: #131314; --card: #1E1F20; --ok: #6DD58C; --bad: #F2B8B5; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 400 14px/1.5 Roboto, "Segoe UI", system-ui, sans-serif; }
+  main { max-width: 620px; margin: 32px auto; padding: 0 16px; }
+  h1 { font-size: 22px; font-weight: 500; margin: 0 0 4px; }
+  .sub { color: var(--soft); margin: 0 0 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 20px; display: grid; gap: 16px; }
+  label.f { display: grid; gap: 6px; font-weight: 500; font-size: 13px; }
+  input[type=text], input[type=password], input[type=number], select {
+    font: inherit; color: inherit; background: transparent; border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; width: 100%;
+  }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 520px) { .row { grid-template-columns: 1fr; } }
+  .check { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; }
+  .check input { margin-top: 3px; }
+  .hint { font-weight: 400; color: var(--soft); font-size: 12px; }
+  .btns { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button { font: inherit; font-weight: 500; border: 0; border-radius: 20px; height: 40px; padding: 0 20px; cursor: pointer; }
+  .primary { background: var(--primary); color: var(--on-primary); }
+  .tonal { background: transparent; color: var(--primary); border: 1px solid var(--line); }
+  #out { font-size: 13px; white-space: pre-wrap; word-break: break-word; }
+  #out.ok { color: var(--ok); }
+  #out.bad { color: var(--bad); }
+  details { color: var(--soft); font-size: 13px; }
+  details ul { margin: 8px 0 0; padding-left: 20px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>TinyTab AI check</h1>
+  <p class="sub">When a step waits too long during playback, TinyTab asks an AI model what the page shows. Then it logs out, reloads, or starts the run again. It also checks each run's start page for an account still signed in.</p>
+  <form class="card" id="form">
+    <label class="check"><input type="checkbox" id="enabled"><span>Use the AI check<br><span class="hint">Needs "Recover on its own" on in the TinyTab panel.</span></span></label>
+    <label class="f">Provider
+      <select id="preset">
+        <option value="deepseek">DeepSeek</option>
+        <option value="openai">OpenAI</option>
+        <option value="custom">Other (OpenAI-style API)</option>
+      </select>
+    </label>
+    <div class="row">
+      <label class="f">API address<input type="text" id="baseUrl" spellcheck="false" placeholder="https://api.deepseek.com"></label>
+      <label class="f">Model<input type="text" id="model" spellcheck="false" placeholder="deepseek-chat"></label>
+    </div>
+    <label class="f">API key<input type="password" id="apiKey" spellcheck="false" autocomplete="off" placeholder="sk-..."><span class="hint">Kept in this browser's extension storage. Sent only to the API address above.</span></label>
+    <div class="row">
+      <label class="f">Check every (seconds)<input type="number" id="every" min="5" max="10"><span class="hint">5 to 10, while a step waits.</span></label>
+      <label class="f">First check after (seconds)<input type="number" id="stuckAfter" min="5" max="120"><span class="hint">On one step, before the AI is asked.</span></label>
+    </div>
+    <label class="check"><input type="checkbox" id="screenshot"><span>Send a screenshot too<br><span class="hint">Only for models that read images (gpt-4o-mini, say). DeepSeek chat reads text only: leave this off.</span></span></label>
+    <div class="btns">
+      <button type="submit" class="primary">Save</button>
+      <button type="button" class="tonal" id="test">Test</button>
+      <span id="out" role="status"></span>
+    </div>
+    <details>
+      <summary>What the AI gets</summary>
+      <ul>
+        <li>The tab's address without the query, its title, and the first 1,500 characters of its visible text.</li>
+        <li>The names of the buttons, links and fields on screen. Never what is typed in a field.</li>
+        <li>The step TinyTab waits to do, as words ("click the Next button").</li>
+        <li>A screenshot, only with "Send a screenshot too" on.</li>
+      </ul>
+    </details>
+  </form>
+</main>
+<script src="options.js"></script>
+</body>
+</html>

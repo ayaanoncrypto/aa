@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "TinyTab",
   "short_name": "TinyTab",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Record what you do on a web page once. TinyTab replays it with its own virtual mouse, in as many tabs as you like.",
   "minimum_chrome_version": "116",
   "icons": {
@@ -17,6 +17,10 @@
       "16": "icons/off-16.png",
       "32": "icons/off-32.png"
     }
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   },
   "background": {
     "service_worker": "background.js"
