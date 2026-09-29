@@ -47,6 +47,7 @@ const readyWaiters = new Map(); // tabId -> Set of resolvers
 const navPending = new Map(); // tabId -> true while a cross-document load is in flight
 const netErrors = new Map(); // tabId -> net::ERR_* while the tab shows Chrome's error page
 const replays = new Map(); // tabId -> the wait before a stuck playback is played again
+const alive = new Set(); // tabs whose page has TinyTab running (it said hello); no ping needed
 
 let defaults = { ...DEFAULTS };
 let lastTape = null;
@@ -59,31 +60,40 @@ let lastTape = null;
 const LOG_MAX = 400;
 let logLines = [];
 let logTimer = 0;
+// The saved log is read when first needed, not each time the worker wakes.
+let logRead = null;
+const loadLog = () =>
+  (logRead ||= chrome.storage.local.get("log").then(
+    (v) => {
+      logLines = [...(v.log || []), ...logLines].slice(-LOG_MAX);
+    },
+    () => {}
+  ));
 function log(text) {
   const d = new Date();
   const p2 = (n) => String(n).padStart(2, "0");
   logLines.push(`${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}  ${String(text).slice(0, 600)}`);
   if (logLines.length > LOG_MAX) logLines = logLines.slice(-LOG_MAX);
   clearTimeout(logTimer);
-  logTimer = setTimeout(() => chrome.storage.local.set({ log: logLines }).catch(() => {}), 400);
+  logTimer = setTimeout(() => loadLog().then(() => chrome.storage.local.set({ log: logLines })).catch(() => {}), 400);
 }
 self.addEventListener("error", (e) => log(`TinyTab error: ${e.message || e.error} (${e.filename || ""}:${e.lineno || ""})`));
 self.addEventListener("unhandledrejection", (e) => log(`TinyTab error: ${(e.reason && (e.reason.stack || e.reason.message)) || e.reason}`));
 
 const ready = (async () => {
   const [local, session] = await Promise.all([
-    chrome.storage.local.get(["defaults", "lastTape", "log"]),
+    chrome.storage.local.get(["defaults", "lastTape"]),
     chrome.storage.session.get(null),
   ]);
   defaults = { ...DEFAULTS, ...(local.defaults || {}) };
   lastTape = local.lastTape || null;
-  logLines = [...(local.log || []), ...logLines].slice(-LOG_MAX);
   const open = new Set((await chrome.tabs.query({})).map((t) => t.id));
   for (const [key, value] of Object.entries(session)) {
     if (!key.startsWith("t:")) continue;
     const id = Number(key.slice(2));
     if (open.has(id)) {
       value.settings = { ...DEFAULTS, ...value.settings }; // settings added since it was saved
+      if (value.tape && value.tape.isLast) value.tape = lastTape ? structuredClone(lastTape) : emptyTape(); // see persist
       tabs.set(id, value);
     } else chrome.storage.session.remove(key);
   }
@@ -155,6 +165,11 @@ function releaseMember(id) {
   notify(id);
 }
 
+// Whether tape is the last tape recorded or opened (lastTape), unchanged.
+function isLastTape(tape) {
+  return !!(lastTape && tape && tape.createdAt === lastTape.createdAt && tape.name === lastTape.name && tape.steps.length === lastTape.steps.length);
+}
+
 function getTab(tabId) {
   let t = tabs.get(tabId);
   if (!t) {
@@ -170,10 +185,12 @@ function persist(tabId, now = false) {
   const write = () => {
     saveTimers.delete(tabId);
     const t = tabs.get(tabId);
-    if (t) chrome.storage.session.set({ ["t:" + tabId]: t }).catch(() => {});
+    // A tab holding the last tape (most do) saves a note, not a copy: every
+    // copy is read again each time the worker wakes, which slowed the toolbar.
+    if (t) chrome.storage.session.set({ ["t:" + tabId]: isLastTape(t.tape) ? { ...t, tape: { isLast: true } } : t }).catch(() => {});
   };
   if (now) write();
-  else saveTimers.set(tabId, setTimeout(write, 250));
+  else saveTimers.set(tabId, setTimeout(write, 1000));
 }
 
 function snapshot(tabId) {
@@ -305,9 +322,13 @@ async function flashBlocked(tabId) {
 const CONTENT_FILES = chrome.runtime.getManifest().content_scripts[0].js;
 
 async function ensureContent(tabId) {
+  if (alive.has(tabId)) return true;
   try {
     const pong = await sendWithTimeout(tabId, { type: "ping" }, 1500);
-    if (pong && pong.ok) return true;
+    if (pong && pong.ok) {
+      alive.add(tabId);
+      return true;
+    }
   } catch (_) {}
   try {
     await within(chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: ["content/clipboard-main.js"], world: "MAIN" }), 10000).catch(() => {});
@@ -324,11 +345,9 @@ async function setOn(tabId, on) {
   await ready;
   const t = getTab(tabId);
   if (on === t.on) {
-    if (on) {
-      await ensureContent(tabId);
-      if (t.mode === "idle") await joinRecording(tabId);
-    }
+    if (on) await ensureContent(tabId);
     notify(tabId);
+    if (on && t.mode === "idle") await joinRecording(tabId);
     return t.on;
   }
   if (on) {
@@ -340,6 +359,7 @@ async function setOn(tabId, on) {
     t.on = true;
     t.error = "";
     if (!t.tape.steps.length && lastTape) t.tape = structuredClone(lastTape);
+    notify(tabId); // the panel shows now; the rest can follow
     await joinRecording(tabId);
   } else {
     if (t.link != null && t.mode === "recording") {
@@ -371,25 +391,32 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
   if (!tab) return;
   const t = getTab(tab.id);
   if (!t.on && !(await setOn(tab.id, true))) return;
-  if (command === "toggle-record") toggleRecord(tab.id);
+  if (command === "toggle-record") toggleRecord(tab.id, tab.url);
   if (command === "toggle-play") togglePlay(tab.id);
 });
 
 // ---------- recording ----------
 
-async function toggleRecord(tabId) {
+// url: the tab's address, when the caller knows it.
+async function toggleRecord(tabId, url) {
   cancelReplay(tabId);
   const t = getTab(tabId);
   if (t.mode === "recording") return stopRecording(tabId);
   if (t.mode === "playing") stopPlayback(tabId);
-  const tab = await chrome.tabs.get(tabId).catch(() => null);
-  t.tape = emptyTape(tab ? tab.url : "");
+  // Recording from now on, before anything that waits: the page's first
+  // steps count, and the panel shows it at once.
+  t.tape = emptyTape(url || "");
   t.mode = "recording";
   t.error = "";
   t.lastAt = Date.now();
   t.play = { index: 0, run: 1 };
   t.group = [tabId];
   delete t.link;
+  notify(tabId);
+  if (!url) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab) t.tape.startUrl = t.tape.tabs[0].startUrl = tab.url;
+  }
   // Every other TinyTab tab in this window joins the recording.
   for (const other of await freeTabsNear(tabId)) addMember(tabId, other.id, other.url);
   for (const id of t.group) freshHook(id);
@@ -471,15 +498,15 @@ function stopRecording(tabId) {
     } catch (_) {}
     const more = t.tape.tabs.length > 1 ? ` (${t.tape.tabs.length} tabs)` : "";
     t.tape.name = t.tape.name || `${host || "tape"}${more} ${new Date().toLocaleString()}`;
-    rememberTape(t.tape);
   }
+  notify(tabId); // the panel first; saving a long tape takes a moment
+  if (t.tape.steps.length) rememberTape(t.tape);
   for (const id of members) {
     const m = tabs.get(id);
     if (m && t.tape.steps.length) m.tape = structuredClone(t.tape);
     releaseMember(id);
   }
   persist(tabId, true);
-  notify(tabId);
 }
 
 function rememberTape(tape) {
@@ -559,6 +586,7 @@ function appendStep(fromTab, step, at, url) {
 // Navigations the user starts from the browser (address bar, reload, back/forward).
 chrome.webNavigation.onCommitted.addListener(async (d) => {
   if (d.frameId !== 0) return;
+  alive.delete(d.tabId); // a new page: TinyTab isn't running there until it says hello
   await ready;
   const t = tabs.get(d.tabId);
   if (!t) return;
@@ -2166,6 +2194,7 @@ async function handle(tabId, msg, url) {
   const t = getTab(tabId);
   switch (msg.type) {
     case "hello":
+      alive.add(tabId);
       if (t.mode === "recording") getTab(leaderOf(tabId)).lastAt = Date.now();
       if (t.mode === "playing" && awakeTabs.has(tabId)) keepAwake(tabId);
       netErrors.delete(tabId); // TinyTab runs here, so this is a real page
@@ -2220,20 +2249,23 @@ async function handle(tabId, msg, url) {
       if (ctl && Date.now() - ctl.actAt < 5000) setClip(ctl, msg.text, tabId);
       return { ok: true };
     }
+    case "keepalive":
+      return { ok: true }; // a panel is showing: stay awake (content/deck.js)
     case "cmd":
-      return command(tabId, t, msg);
+      return command(tabId, t, { ...msg, url });
   }
   return { ok: false };
 }
 
 async function command(tabId, t, msg) {
   if (t.link != null && ["record", "play", "stop"].includes(msg.action)) {
+    msg = { ...msg, url: undefined }; // the leader's page, not this one
     tabId = leaderOf(tabId);
     t = getTab(tabId);
   }
   switch (msg.action) {
     case "record":
-      await toggleRecord(tabId);
+      await toggleRecord(tabId, msg.url);
       break;
     case "play":
       await togglePlay(tabId);
@@ -2272,6 +2304,7 @@ async function command(tabId, t, msg) {
       break;
     }
     case "getLog":
+      await loadLog();
       return { ok: true, lines: logLines.slice() };
     case "aiSettings":
       await chrome.runtime.openOptionsPage();
@@ -2301,6 +2334,7 @@ chrome.storage.onChanged.addListener(async (changes, area) => {
 // ---------- cleanup ----------
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  alive.delete(tabId);
   stopPlayback(tabId);
   players.delete(tabId);
   tabs.delete(tabId);

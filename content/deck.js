@@ -192,9 +192,13 @@
 
   // ---------- font ----------
 
+  // Off: adding a font to the page makes the browser restyle all of it, which
+  // took a moment on big pages (exchanges) when the panel first showed.
+  // Roboto where the computer has it, else the system font (see CSS).
+  const LOAD_FONTS = false;
   let fontsLoaded = false;
   function loadFonts() {
-    if (fontsLoaded) return;
+    if (fontsLoaded || !LOAD_FONTS) return;
     fontsLoaded = true;
     for (const [file, weight] of [
       ["roboto-latin-400-normal.woff2", "400"],
@@ -313,10 +317,51 @@
 
   // ---------- actions ----------
 
+  // Record, Play, Stop and Off change the panel on the click. The service
+  // worker's state follows and sets it right; on a busy page that round
+  // trip is what made the buttons feel slow.
+  function answerNow(action) {
+    if (!state) return;
+    const s = { ...state };
+    if (action === "off") {
+      TT.recorder.stop();
+      TT.player.end();
+      return TT.deck.hide();
+    }
+    if (action === "record") {
+      if (s.mode === "recording") {
+        s.mode = "idle";
+        TT.recorder.stop();
+      } else {
+        s.mode = "recording";
+        s.ticks = [];
+        s.index = 0;
+        s.error = "";
+        TT.player.end();
+        TT.recorder.start(s.settings); // after the command went: the worker records by then
+      }
+    } else if (action === "play") {
+      if (s.mode === "playing") {
+        s.mode = "idle";
+        TT.player.end();
+      } else if (s.mode === "idle" && s.ticks.length) {
+        s.mode = "playing";
+        s.index = 0;
+        s.run = 1;
+        s.error = "";
+      } else return;
+    } else return;
+    state = s;
+    if (s.mode !== "playing") waiting = "";
+    render();
+  }
+
   async function command(action, extra = {}) {
     if (action === "record" || action === "play" || action === "off") TT.recorder.flush();
     try {
-      const res = await TT.send({ type: "cmd", action, ...extra });
+      const sent = TT.send({ type: "cmd", action, ...extra });
+      answerNow(action);
+      const res = await sent;
       if (res && res.ok === false && res.error) message(res.error, "error");
       return res;
     } catch (_) {
@@ -504,15 +549,29 @@
     else if ($(".msg").className === "msg" && !$(".msg").hidden) hideMessage();
   }
 
+  // While the panel shows, a ping every 20 s keeps the service worker awake
+  // (Chrome stops it after 30 s idle). Waking it again is what made the
+  // toolbar button and the panel's buttons slow after a pause.
+  let awake = 0;
+  const keepAwake = () => {
+    if (!awake) awake = setInterval(() => TT.send({ type: "keepalive" }).catch(() => TT.orphaned && TT.orphaned()), 20000);
+  };
+  const letSleep = () => {
+    clearInterval(awake);
+    awake = 0;
+  };
+
   TT.deck = {
     show(s) {
       state = s;
       if (s.mode !== "playing") waiting = "";
       mount();
       render();
+      keepAwake();
     },
     hide() {
       state = null;
+      letSleep();
       unmount();
     },
     tick() {
