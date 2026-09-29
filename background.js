@@ -1313,6 +1313,55 @@ async function goToGoal(lead, ctl, id, url) {
   say(lead, "");
 }
 
+// The last click before step i, or -1: the step just before, or, in the
+// same tab, the click a scroll or hover followed. Only a plain click on a
+// button or link (not a copy button, not the page itself).
+function lastClickBefore(steps, i) {
+  let k = i - 1;
+  const slot = steps[i].tab || 0;
+  for (let j = i - 1; j >= 0 && i - j <= 3 && (steps[j].tab || 0) === slot; j--) {
+    if (["scroll", "hover", "path"].includes(steps[j].type)) continue;
+    k = j;
+    break;
+  }
+  const prev = steps[k];
+  if (!prev || prev.type !== "click" || prev.copies || !prev.target || ["html", "body"].includes(prev.target.tag)) return -1;
+  return k;
+}
+
+// A click that didn't take: the next step has waited AGAIN_AFTER_MS, the tab
+// still shows the page of the last click and its button is there and
+// usable. Click it again and go on from the waiting step (no reload, no
+// restart); up to AGAIN_MAX times a step, then the usual checks take over.
+// Send is left to the code rule. Checked every 1.5 s, no AI needed.
+const AGAIN_AFTER_MS = 4000;
+const AGAIN_MAX = 3;
+async function clickWatch(lead, ctl, t) {
+  const steps = t.tape.steps;
+  const over = () => ctl.cancelled || ctl.over;
+  while (!over()) {
+    await sleep(1500, ctl);
+    const cur = ctl.cur;
+    if (over() || !cur || ctl.kick || ctl.nextKick || t.settings.recover === false) continue;
+    if (Date.now() - cur.since < AGAIN_AFTER_MS || (ctl.aiAgain.get(cur.i) || 0) >= AGAIN_MAX) continue;
+    if (ctl.codeSent && ctl.codeTicking) continue; // the code is on its way
+    const i = cur.i;
+    const k = lastClickBefore(steps, i);
+    if (k < 0 || isSendStep(steps[k]) || !steps[i].target) continue;
+    const prevId = ctl.group[steps[k].tab || 0];
+    if (prevId == null || navPending.get(prevId) || netErrors.has(prevId)) continue;
+    // Still on the page of that click (tapes from 2.0.2 on know it).
+    const tab = await chrome.tabs.get(prevId).catch(() => null);
+    if (!tab || (steps[k].page && pageOf(tab.url) !== steps[k].page)) continue;
+    // The waiting step's element isn't there, the last button is.
+    if (await probeOne(cur.id, steps[i].target)) continue;
+    if (!(await probeOne(prevId, steps[k].target))) continue;
+    if (over() || ctl.cur !== cur) continue;
+    const name = steps[k].target.text ? `"${steps[k].target.text.slice(0, 40)}"` : "the last button";
+    kick(ctl, { action: "again", k, id: prevId, why: `${name} (step ${k + 1}) didn't take: the page is the same and the button is still there` });
+  }
+}
+
 // Runs beside one playback until it ends: the code rule, every 2 s.
 async function codeWatch(lead, ctl, t) {
   await aiLoaded;
@@ -1678,6 +1727,7 @@ async function startPlayback(tabId, resumed, again = null) {
     codeSent: null, // { s, id, at, seen }: the tape's Send was pressed, the code not typed yet
     codeTicking: false, // the countdown runs at codeMin or more
     aiGoal: new Map(), // step index -> went to the goal page for it
+    aiAgain: new Map(), // step index -> clicks of the step before it, again (clickWatch)
     steps: null, // the tape's steps, for goToGoal
     aiReloads: new Map(), // step index -> reloads the AI check asked for in this run
     over: false, // playback ended
@@ -1687,6 +1737,7 @@ async function startPlayback(tabId, resumed, again = null) {
   const t = getTab(tabId);
   ctl.steps = t.tape.steps;
   aiWatch(tabId, ctl, t).catch((e) => log(`AI check stopped: ${(e && e.message) || e}`));
+  clickWatch(tabId, ctl, t).catch((e) => log(`Click check stopped: ${(e && e.message) || e}`));
   if (t.tape.steps.some(isSendStep)) codeWatch(tabId, ctl, t).catch((e) => log(`Code rule stopped: ${(e && e.message) || e}`));
   t.mode = "playing";
   t.error = "";
@@ -1847,9 +1898,15 @@ async function startPlayback(tabId, resumed, again = null) {
       const slot = k.slot != null ? k.slot : steps[i].tab || 0;
       if (k.id != null) id = k.id; // the start check names its tab
       trouble = `Step ${i + 1}: ${k.why}`;
-      const next = { logout: "Logging out, then starting again.", restart: "Starting again from step 1.", refresh: "Reloading the page.", goal: `Going to the ${aiConfig.goalLink} page.` }[k.action];
+      const next = { logout: "Logging out, then starting again.", restart: "Starting again from step 1.", refresh: "Reloading the page.", goal: `Going to the ${aiConfig.goalLink} page.`, again: "Clicking it again." }[k.action];
       sendGroup(tabId, { type: "warn", text: `${trouble}. ${next}` });
       if (k.action === "restart") return (goTo = -1);
+      if (k.action === "again") {
+        ctl.aiAgain.set(i, (ctl.aiAgain.get(i) || 0) + 1);
+        const res = await performStep(id, ctl, { type: "perform", i: k.k, step: steps[k.k], lead: 0, speed: "max", patient: false, from: ctl.last, clip: ctl.clip, settings: t.settings });
+        if (res && res.x != null) ctl.last = { x: res.x, y: res.y };
+        return (goTo = i); // and on with the step that waited
+      }
       if (k.action === "logout") {
         say(tabId, "Logging out");
         // A click of the step may have started a page change: let it land
@@ -2068,6 +2125,7 @@ async function startPlayback(tabId, resumed, again = null) {
       ctl.tries.clear();
       ctl.aiReloads.clear();
       ctl.aiGoal.clear();
+      ctl.aiAgain.clear();
       ctl.codeSent = null;
       t.play.index = 0;
       t.play.run += 1;
