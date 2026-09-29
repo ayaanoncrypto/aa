@@ -17,9 +17,18 @@ const AI_DEFAULTS = {
   baseUrl: AI_BUILTIN_SERVICE.baseUrl,
   model: AI_BUILTIN_SERVICE.model,
   apiKey: AI_BUILTIN,
-  every: 8, // seconds between checks while a step waits (5 to 10)
+  every: 5, // seconds between checks (5 to 10)
   stuckAfter: 10, // seconds on one step before the first check
   screenshot: AI_BUILTIN_SERVICE.screenshot, // for models that read images
+  // Task rules, checked by TinyTab itself (background.js), with or without an AI:
+  codeRule: true, // after Send: "Send" still there, or the countdown below codeMin: start again
+  codeMin: 65, // seconds
+  goalLink: "8th Anniversary", // the page the task begins from, reached by this link...
+  goalButton: "Register", // ...and the tape's button there
+  // On a page the tape doesn't visit near this step, and the AI says it's
+  // none of these: log out and start again.
+  pageRule: true,
+  allowedPages: "the sign-up page, the send-code (verification code) page, the 8th Anniversary page",
 };
 const AI_PAGES = ["expected", "start", "home", "login", "error", "blank", "loading", "other"];
 const AI_TIMEOUT_MS = 25000;
@@ -38,9 +47,17 @@ function cleanAiConfig(raw) {
   c.baseUrl = String(c.baseUrl || "").trim().replace(/\/+$/, "");
   c.model = String(c.model || "").trim();
   c.apiKey = String(c.apiKey || "").trim() || AI_BUILTIN;
+  // Settings saved before version 2 had checks every 8 s: now every 5 s.
+  if (!raw || raw.v !== 2) c.every = AI_DEFAULTS.every;
   c.every = Math.max(5, Math.min(10, Math.round(Number(c.every)) || AI_DEFAULTS.every));
   c.stuckAfter = Math.max(5, Math.min(120, Math.round(Number(c.stuckAfter)) || AI_DEFAULTS.stuckAfter));
   c.screenshot = !!c.screenshot;
+  c.codeRule = c.codeRule !== false;
+  c.codeMin = Math.max(1, Math.min(300, Math.round(Number(c.codeMin)) || AI_DEFAULTS.codeMin));
+  c.goalLink = String(c.goalLink == null ? AI_DEFAULTS.goalLink : c.goalLink).trim().slice(0, 80);
+  c.goalButton = String(c.goalButton == null ? AI_DEFAULTS.goalButton : c.goalButton).trim().slice(0, 80);
+  c.pageRule = c.pageRule !== false;
+  c.allowedPages = String(c.allowedPages == null ? AI_DEFAULTS.allowedPages : c.allowedPages).trim().slice(0, 300);
   return c;
 }
 
@@ -48,7 +65,7 @@ const aiUsable = (c = aiConfig) => c.enabled && !!c.apiKey && /^https?:\/\/./.te
 const aiLabel = () => (aiUsable() ? aiConfig.model : "");
 
 const AI_SYSTEM = `You watch TinyTab, a browser extension that replays a recorded task in a browser tab. You get a text snapshot of the tab (sometimes a screenshot too) and the step TinyTab is waiting to do. Answer with one JSON object and nothing else:
-{"page": "...", "stuck": true or false, "signedIn": true or false, "atStart": true or false, "reason": "a few words"}
+{"page": "...", "stuck": true or false, "signedIn": true or false, "atStart": true or false, "onGoal": true or false, "allowed": true or false, "reason": "a few words"}
 
 page, pick one:
 - "expected": the page the waiting step belongs on, loaded normally. Content still arriving there (an email, a list) counts as expected.
@@ -62,7 +79,9 @@ page, pick one:
 
 stuck: true when waiting longer won't help: the page is frozen, blank, stuck loading, or shows an error.
 signedIn: true when the page shows a signed-in account (account menu, avatar, balance, log out control).
-atStart: true when the page is ready for the recording's first step.`;
+atStart: true when the page is ready for the recording's first step.
+onGoal: true when the tab shows task.goal.page (false when task.goal is missing).
+allowed: true when the tab shows one of task.allowedPages (true when task.allowedPages is missing).`;
 
 // The model's answer as { page, stuck, signedIn, atStart, reason }.
 function parseAiAnswer(text) {
@@ -78,6 +97,8 @@ function parseAiAnswer(text) {
     stuck: yes(raw.stuck),
     signedIn: yes(raw.signedIn),
     atStart: yes(raw.atStart),
+    onGoal: yes(raw.onGoal),
+    allowed: raw.allowed == null ? true : yes(raw.allowed),
     reason: String(raw.reason || "").replace(/\s+/g, " ").trim().slice(0, 160),
   };
 }
@@ -125,6 +146,11 @@ const JEV_QUESTIONS = {
 const JEV_YES = 0.6;
 
 async function aiAskJev(snap, job, cfg) {
+  const goal = job && job.goal;
+  const allowed = job && job.allowedPages;
+  const questions = { ...JEV_QUESTIONS };
+  if (goal) questions.onGoal = { type: "noul", instructions: `Is the tab on ${goal.page}?` };
+  if (allowed) questions.allowed = { type: "noul", instructions: `Is the tab on one of these pages: ${allowed}?` };
   const r = await aiPost(cfg.baseUrl + "/v1/systemone", cfg, {
     model: cfg.model,
     state: {
@@ -132,7 +158,7 @@ async function aiAskJev(snap, job, cfg) {
       task: job,
       tab: snap || "the page did not answer",
     },
-    questions: JEV_QUESTIONS,
+    questions,
   });
   if (!r.ok) throw await aiFailed(r);
   const data = await r.json();
@@ -146,7 +172,10 @@ async function aiAskJev(snap, job, cfg) {
     stuck: p("stuck") >= JEV_YES,
     signedIn: p("signedIn") >= JEV_YES,
     atStart: p("atStart") >= 0.5,
-    reason: `Jev: ${page} ${pct(a.page.confidence || 0)}, stuck ${pct(p("stuck"))}, signed in ${pct(p("signedIn"))}, at start ${pct(p("atStart"))}`,
+    onGoal: p("onGoal") >= 0.5,
+    // Log out and start over only on a clear no.
+    allowed: !allowed || !a.allowed || typeof a.allowed.noul !== "number" || a.allowed.noul > 1 - JEV_YES,
+    reason: `Jev: ${page} ${pct(a.page.confidence || 0)}, stuck ${pct(p("stuck"))}, signed in ${pct(p("signedIn"))}, at start ${pct(p("atStart"))}${goal ? `, on ${goal.name} ${pct(p("onGoal"))}` : ""}${allowed && a.allowed ? `, allowed page ${pct(p("allowed"))}` : ""}`,
   };
 }
 

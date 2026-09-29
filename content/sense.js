@@ -222,6 +222,57 @@
     return `${name || "unnamed"} (${el.localName === "input" ? el.type || "text" : el.localName})`;
   };
 
+  // ---------- task rules (background.js: codeWatch, goToGoal) ----------
+
+  // A sign-up form's code button: "Send" while the code hasn't gone, then a
+  // countdown in seconds ("90s", "Resend (58s)") once it has.
+  const SEND_CODE = /^(send|send code|get code|get the code|resend|resend code|send again|get verification code|send verification code|obtain code|获取验证码|发送|发送验证码|重新发送)$/i;
+  const SECONDS = /(\d{1,3})\s*(?:s|sec|secs|seconds?|秒)(?![a-z])/i;
+  function codeTimer() {
+    let send = "";
+    let seconds = null;
+    for (const el of document.querySelectorAll('button, a, [role="button"], span, div, input[type="button"]')) {
+      if (el.children.length > 2 || TT.HOST_TAGS.has(el.localName)) continue;
+      const raw = el.localName === "input" ? el.value : el.textContent && el.textContent.length <= 30 ? el.textContent : "";
+      const text = clean(raw);
+      if (!text) continue;
+      const m = SECONDS.exec(text);
+      if (!m && !SEND_CODE.test(text)) continue;
+      if (!TT.isVisible(el)) continue;
+      if (m) {
+        const n = Number(m[1]);
+        if (n <= 300 && (seconds == null || n < seconds)) seconds = n;
+      } else if (!send && !TT.isDisabled(el)) send = text;
+    }
+    return { send, seconds };
+  }
+
+  // Clicks the link or button named like name ("8th Anniversary"): whole
+  // name first, then one that holds the name.
+  const norm = (s) => clean(s).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  function clickText(name) {
+    const want = norm(name);
+    if (!want) return { done: false };
+    let best = null;
+    let bestScore = 0;
+    for (const el of document.querySelectorAll('a, button, [role="button"], [role="menuitem"], [role="tab"], li, span, div, img')) {
+      if (TT.HOST_TAGS.has(el.localName)) continue;
+      const raw = el.localName === "img" ? el.getAttribute("alt") || "" : el.textContent && el.textContent.length <= 80 ? el.textContent : "";
+      const text = norm(raw) || norm(hintOf(el));
+      if (!text || !text.includes(want) || !TT.isVisible(el)) continue;
+      const score = (text === want ? 4 : 1) + (el.localName === "a" || el.localName === "button" || el.getAttribute("role") ? 2 : 0);
+      if (score > bestScore) {
+        best = el;
+        bestScore = score;
+      }
+    }
+    if (!best) return { done: false };
+    const label = clean(best.localName === "img" ? best.getAttribute("alt") : best.textContent).slice(0, 60) || name;
+    // Answer first, then press: the click usually leaves the page.
+    setTimeout(() => TT.player.press(best), 60);
+    return { done: true, label };
+  }
+
   // The page in words: address without the query, title, the start of its
   // text, and the names of what is on screen. Never what is typed in a field.
   // watch: how long to look for changes, in ms (0: don't).
@@ -246,10 +297,11 @@
       fields: onScreen('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select', fieldName, 15),
       dialogs: onScreen('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open]', (el) => clean(el.innerText).slice(0, 200), 3),
       signOut,
+      code: codeTimer(), // the code button: "Send", or a countdown
     };
     snap.changing = await changing; // still loading or updating while watched
     return snap;
   }
 
-  TT.sense = { signOut, unblock, signOutControls, menuOpeners, SIGN_OUT, snapshot };
+  TT.sense = { signOut, unblock, signOutControls, menuOpeners, SIGN_OUT, snapshot, codeTimer, clickText };
 })();

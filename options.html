@@ -36,6 +36,7 @@
   #out.ok { color: var(--ok); }
   #out.bad { color: var(--bad); }
   details { color: var(--soft); font-size: 13px; }
+  h2 { font-size: 16px; font-weight: 500; margin: 8px 0 0; }
   details ul { margin: 8px 0 0; padding-left: 20px; }
 </style>
 </head>
@@ -60,10 +61,20 @@
     </div>
     <label class="f">API key<input type="password" id="apiKey" spellcheck="false" autocomplete="off" placeholder="sk-..."><span class="hint">Kept in this browser's extension storage. Sent only to the API address above.</span></label>
     <div class="row">
-      <label class="f">Check every (seconds)<input type="number" id="every" min="5" max="10"><span class="hint">5 to 10, while a step waits.</span></label>
+      <label class="f">Check every (seconds)<input type="number" id="every" min="5" max="10"><span class="hint">5 to 10.</span></label>
       <label class="f">First check after (seconds)<input type="number" id="stuckAfter" min="5" max="120"><span class="hint">On one step, before the AI is asked.</span></label>
     </div>
     <label class="check"><input type="checkbox" id="screenshot"><span>Send a screenshot too<br><span class="hint">Only for models that read images (Gemini, gpt-4o-mini). Jev and DeepSeek chat read text only: leave this off.</span></span></label>
+    <h2>Task rules</h2>
+    <p class="hint" style="margin:-8px 0 0">TinyTab checks these itself every 2 seconds, with or without the AI. They need "Recover on its own".</p>
+    <label class="check"><input type="checkbox" id="codeRule"><span>Watch the code button<br><span class="hint">After TinyTab presses Send: if "Send" is still there, the code didn't go. Start again from the start. A countdown in seconds means the code went: wait.</span></span></label>
+    <label class="f">Start again when the countdown is below (seconds)<input type="number" id="codeMin" min="1" max="300"><span class="hint">The countdown starts at 90. Below this number, the code isn't coming.</span></label>
+    <div class="row">
+      <label class="f">Start page link<input type="text" id="goalLink" spellcheck="false" placeholder="8th Anniversary"><span class="hint">Off this page at the start: TinyTab clicks this link. Empty: off.</span></label>
+      <label class="f">Button on that page<input type="text" id="goalButton" spellcheck="false" placeholder="Register"><span class="hint">The tape's button there. Signed in on that page: log out.</span></label>
+    </div>
+    <label class="check"><input type="checkbox" id="pageRule"><span>Anywhere else: log out and start again<br><span class="hint">Every check, on a page the recording doesn't visit at that point, Jev is asked whether the tab is on one of the pages below. A clear no: log out, then start again. Only in the tab with the start page link.</span></span></label>
+    <label class="f">Allowed pages<input type="text" id="allowedPages" spellcheck="false"><span class="hint">In words, for the AI.</span></label>
     <div class="btns">
       <button type="submit" class="primary">Save</button>
       <button type="button" class="tonal" id="test">Test</button>

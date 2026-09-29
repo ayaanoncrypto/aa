@@ -93,6 +93,12 @@
       case "snapshot":
         TT.sense.snapshot(msg.watch).then((snap) => reply({ ok: true, snap }), (e) => reply({ ok: false, error: String(e) }));
         return true;
+      case "codeTimer":
+        reply({ ok: true, ...TT.sense.codeTimer() });
+        return;
+      case "clickText":
+        reply({ ok: true, ...TT.sense.clickText(msg.text) });
+        return;
       case "abort":
         TT.player.abort();
         reply({ ok: true });
