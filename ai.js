@@ -25,6 +25,7 @@ const AI_DEFAULTS = {
   codeMin: 65, // seconds
   goalLink: "8th Anniversary", // the page the task begins from, reached by this link...
   goalButton: "Register", // ...and the tape's button there
+  signedInText: "Go to Trade", // on the goal page in place of goalButton: already signed up, log out
   // On a page the tape doesn't visit near this step, and the AI says it's
   // none of these: log out and start again.
   pageRule: true,
@@ -58,6 +59,7 @@ function cleanAiConfig(raw) {
   c.goalLink = String(c.goalLink == null ? AI_DEFAULTS.goalLink : c.goalLink).trim().slice(0, 80);
   c.goalButton = String(c.goalButton == null ? AI_DEFAULTS.goalButton : c.goalButton).trim().slice(0, 80);
   c.pageRule = c.pageRule !== false;
+  c.signedInText = String(c.signedInText == null ? AI_DEFAULTS.signedInText : c.signedInText).trim().slice(0, 80);
   c.referralCode = String(c.referralCode == null ? AI_DEFAULTS.referralCode : c.referralCode).trim().slice(0, 60);
   c.allowedPages = String(c.allowedPages == null ? AI_DEFAULTS.allowedPages : c.allowedPages).trim().slice(0, 300);
   return c;

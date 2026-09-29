@@ -233,32 +233,73 @@
   const TIMER_WORDS = /\b(resend|send|again|in|after|later|code|get|retry|wait)\b|重新发送|后重发|重发|后|获取|发送/gi;
   const onlyTimer = (text, m) => !text.replace(m[0], "").replace(TIMER_WORDS, "").replace(/[\s()\[\]:：,.-]/g, "");
   const BUTTONISH = 'button, [role="button"], a, input[type="button"]';
+  // Short text on the page, one entry per text node: [text, its element].
+  // Walks the text only: reading every box's textContent took seconds on
+  // big pages (exchanges), and the page went unanswered meanwhile.
+  function shortTexts(max = 30) {
+    const out = [];
+    if (!document.body) return out;
+    const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+      const v = n.nodeValue;
+      if (!v || v.length > 200) continue;
+      const t = clean(v);
+      if (t && t.length <= max && n.parentElement) out.push([t, n.parentElement]);
+    }
+    return out;
+  }
+
   function codeTimer() {
     let send = "";
     let seconds = null;
     let text = "";
     let inButton = false;
-    for (const el of document.querySelectorAll('button, a, [role="button"], span, div, input[type="button"]')) {
-      if (el.children.length > 2 || TT.HOST_TAGS.has(el.localName)) continue;
-      const raw = el.localName === "input" ? el.value : el.textContent && el.textContent.length <= 30 ? el.textContent : "";
-      const t = clean(raw);
-      if (!t) continue;
-      const m = SECONDS.exec(t) || (el.matches(BUTTONISH) ? /^\(?\s*(\d{1,3})\s*\)?$/.exec(t) : null); // "(74)" on the button itself
-      if (m && !onlyTimer(t, m)) continue;
-      if (!m && !SEND_CODE.test(t)) continue;
-      if (!TT.isVisible(el)) continue;
+    const look = (t, el) => {
+      if (TT.HOST_TAGS.has(el.localName)) return;
+      const btn = el.closest(BUTTONISH);
+      const m = SECONDS.exec(t) || (btn ? /^\(?\s*(\d{1,3})\s*\)?$/.exec(t) : null); // "(74)" on the button itself
+      if (m && !onlyTimer(t, m)) return;
+      if (!m && !SEND_CODE.test(t)) return;
+      if (!TT.isVisible(el)) return;
       if (m) {
         const n = Number(m[1]);
-        const button = !!el.closest(BUTTONISH);
+        const button = !!btn;
         // The code button's own countdown wins over any other timer on the page.
         if (n <= 300 && (seconds == null || (button && !inButton) || (button === inButton && n > seconds))) {
           seconds = n;
           text = t;
           inButton = button;
         }
-      } else if (!send && !TT.isDisabled(el)) send = t;
+      } else if (!send && !TT.isDisabled(btn || el)) send = t;
+    };
+    for (const [t, el] of shortTexts()) {
+      // A countdown split over boxes ("<b>74</b>s") reads from the box around it.
+      const whole = el.parentElement && el.parentElement.childElementCount <= 2 ? clean(el.parentElement.textContent) : "";
+      look(t, el);
+      if (whole && whole !== t && whole.length <= 30) look(whole, el.parentElement);
     }
-    return { send, seconds, text };
+    for (const el of document.querySelectorAll('input[type="button"], input[type="submit"]')) if (el.value) look(clean(el.value), el);
+    return { send, seconds, text, codeBox: codeBoxes() };
+  }
+
+  // Boxes for a verification code on screen: one box per digit, or a box
+  // named for a code (never the invite code box).
+  function codeBoxes() {
+    for (const el of document.querySelectorAll('input:not([type="hidden"]):not([type="email"]):not([type="password"]):not([type="checkbox"]):not([type="radio"])')) {
+      const own = [el.getAttribute("placeholder"), el.getAttribute("aria-label"), el.name, el.id, el.getAttribute("autocomplete")].join(" ");
+      const digit = el.maxLength > 0 && el.maxLength <= 8;
+      if ((digit || /code|verif|otp|one-time|pin\b|验证码/i.test(own)) && !REFERRAL.test(own) && TT.isVisible(el)) return true;
+    }
+    return false;
+  }
+
+  // Whether text ("Go to Trade") shows on the page.
+  function hasText(text) {
+    const want = norm(text);
+    if (!want) return false;
+    for (const [t, el] of shortTexts(80)) if (norm(t).includes(want) && TT.isVisible(el)) return true;
+    for (const el of document.querySelectorAll('input[type="button"], input[type="submit"]')) if (norm(el.value).includes(want) && TT.isVisible(el)) return true;
+    return false;
   }
 
   // Clicks the link or button named like name ("8th Anniversary"): whole
@@ -313,11 +354,15 @@
   const REF_OPENER = /(invit\w*|refer\w*|promo\w*|推荐|邀请|招待|紹介|초대|추천)[^a-z0-9]{0,3}(code|id\b|码|코드|コード)/i;
   function referralOpeners() {
     let best = null;
-    for (const el of document.querySelectorAll('button, a, [role="button"], label, span, div, p, h4, h5, h6')) {
-      const text = el.textContent || "";
-      if (text.length > 60 || TT.HOST_TAGS.has(el.localName) || !REF_OPENER.test(text) || el.querySelector("input, textarea") || !TT.isVisible(el)) continue;
+    for (const [text, el0] of shortTexts(60)) {
+      if (!REF_OPENER.test(text)) continue;
+      // The text's box, or the box around it when the words are split.
+      let el = el0;
+      if (el.closest("tinytab-deck") || el.querySelector("input, textarea") || !TT.isVisible(el)) continue;
       if (el.localName === "a" && /^(https?:|\/)/i.test(el.getAttribute("href") || "")) continue;
-      if (!best || best.contains(el)) best = el; // the innermost
+      const link = el.closest("a[href]");
+      if (link && /^(https?:|\/)/i.test(link.getAttribute("href") || "")) continue;
+      if (!best) best = el;
     }
     if (!best) return [];
     // The text itself, then the row around it (where the ⌄ arrow and the
@@ -401,5 +446,5 @@
     return snap;
   }
 
-  TT.sense = { signOut, unblock, signOutControls, menuOpeners, SIGN_OUT, snapshot, codeTimer, clickText, referral };
+  TT.sense = { signOut, unblock, signOutControls, menuOpeners, SIGN_OUT, snapshot, codeTimer, clickText, referral, hasText };
 })();

@@ -99,6 +99,9 @@
       case "codeTimer":
         reply({ ok: true, ...TT.sense.codeTimer() });
         return;
+      case "hasText":
+        reply({ ok: true, found: TT.sense.hasText(String(msg.text || "")) });
+        return;
       case "clickText":
         reply({ ok: true, ...TT.sense.clickText(msg.text) });
         return;

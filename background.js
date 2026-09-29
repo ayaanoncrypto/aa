@@ -1281,7 +1281,8 @@ const isSendStep = (st) => st.type === "click" && !!st.target && SEND_CODE.test(
 function goalStep(steps) {
   const want = aiConfig.goalButton.toLowerCase();
   if (!aiConfig.goalLink || !want) return -1;
-  return steps.findIndex((st) => PLACE_TYPES.has(st.type) && st.target && String(st.target.text || "").trim().toLowerCase() === want);
+  // "Register" matches "Register Now" too.
+  return steps.findIndex((st) => PLACE_TYPES.has(st.type) && st.target && String(st.target.text || "").trim().toLowerCase().includes(want));
 }
 
 // Gets tab id to the goal page: clicks the goalLink link there, else loads
@@ -1343,9 +1344,16 @@ async function clickWatch(lead, ctl, t) {
     await sleep(1500, ctl);
     const cur = ctl.cur;
     if (over() || !cur || ctl.kick || ctl.nextKick || t.settings.recover === false) continue;
-    if (Date.now() - cur.since < AGAIN_AFTER_MS || (ctl.aiAgain.get(cur.i) || 0) >= AGAIN_MAX) continue;
+    if (Date.now() - cur.at < 1500) continue;
     if (ctl.codeSent && ctl.codeTicking) continue; // the code is on its way
     const i = cur.i;
+    // "Go to Trade" in place of Register on the goal page: signed in. Log out.
+    const gs = goalStep(steps);
+    if (gs >= 0 && aiConfig.signedInText && (steps[gs].tab || 0) === (steps[i].tab || 0) && i <= gs + PLACE_BACK && (await pageHasText(cur.id, aiConfig.signedInText))) {
+      if (!over() && ctl.cur && ctl.cur.i === i) kick(ctl, { action: "logout", why: `"${aiConfig.signedInText}" shows where "${aiConfig.goalButton}" should be: already signed up and signed in` });
+      continue;
+    }
+    if (Date.now() - cur.at < AGAIN_AFTER_MS || (ctl.aiAgain.get(i) || 0) >= AGAIN_MAX) continue;
     const k = lastClickBefore(steps, i);
     if (k < 0 || isSendStep(steps[k]) || ctl.refSkip.has(k) || !steps[i].target) continue;
     const prevId = ctl.group[steps[k].tab || 0];
@@ -1425,14 +1433,37 @@ async function ensureReferral(ctl, id) {
   else if (r.state === "filled" && !same) log(`  Referral field already holds "${r.value}": left as it is`);
 }
 
+// Whether text shows in tab id ("Go to Trade" on the goal page).
+async function pageHasText(id, text) {
+  if (!text) return false;
+  const r = await sendWithTimeout(id, { type: "hasText", text }, 3000).catch(() => null);
+  return !!(r && r.ok && r.found);
+}
+
 // Runs beside one playback until it ends: the code rule, every 2 s.
 async function codeWatch(lead, ctl, t) {
   await aiLoaded;
+  const steps = t.tape.steps;
   const over = () => ctl.cancelled || ctl.over;
   while (!over()) {
     await sleep(2000, ctl);
-    const w = ctl.codeSent;
-    if (over() || !w || ctl.kick || ctl.nextKick || !aiConfig.codeRule || t.settings.recover === false) continue;
+    if (over() || ctl.kick || ctl.nextKick || !aiConfig.codeRule || t.settings.recover === false) continue;
+    let w = ctl.codeSent;
+    if (!w) {
+      // No Send pressed: a page that sent the code by itself (code boxes and
+      // "21 S" under them, after Next). Watch it the same way. Not in a tab
+      // where the code went in during the last minute (the page may linger).
+      for (const [slot, id] of (ctl.group || []).entries()) {
+        if (Date.now() - (ctl.codeDone.get(id) || 0) < 60000) continue;
+        const r = await sendWithTimeout(id, { type: "codeTimer" }, 4000).catch(() => null);
+        if (r && r.ok && r.codeBox && r.seconds != null) {
+          w = ctl.codeSent = { s: Math.max(-1, t.play.index - 1), id, slot, at: Date.now(), seen: false, auto: true };
+          log(`  Code page in tab ${slot + 1}: watching its timer`);
+          break;
+        }
+      }
+      if (!w) continue;
+    }
     const r = await sendWithTimeout(w.id, { type: "codeTimer" }, 4000).catch(() => null);
     if (!r || !r.ok || ctl.codeSent !== w || over()) continue;
     let why = "";
@@ -1445,12 +1476,19 @@ async function codeWatch(lead, ctl, t) {
       }
       w.seen = true;
       if (!ctl.codeTicking) why = `the code timer is at ${r.seconds} s ("${r.text}"), below ${aiConfig.codeMin} s, and the code hasn't come`;
+    } else if (w.auto) {
+      // The code page is gone (the run went on, or back): stop watching.
+      if (!r.codeBox) {
+        ctl.codeSent = null;
+        ctl.codeTicking = false;
+      } else if (r.send || /resend/i.test(r.text || "")) why = "the code timer ran out on the code page";
     } else if (r.send && Date.now() - w.at >= 3000) {
       ctl.codeTicking = false;
       why = w.seen ? `the code timer ran out ("${r.send}" is back)` : `"${r.send}" is still on the page: the code wasn't sent`;
     }
     if (!why) continue;
     ctl.codeSent = null;
+    ctl.codeTicking = false;
     const verdict = { action: "restart", why };
     if (ctl.cur) kick(ctl, verdict);
     else ctl.nextKick = verdict;
@@ -1508,6 +1546,9 @@ async function aiJudge(lead, ctl, t, i, id, ms, stuck = true) {
   if (!stuck && !off) return null;
   const shot = await aiShot(id, awakeTabs.has(id));
   if (!snap && !shot) {
+    // A heavy page can be slow to describe but still alive: ping it.
+    const pong = await sendWithTimeout(id, { type: "ping" }, 3000).catch(() => null);
+    if (pong && pong.ok) return null;
     // No answer from the page: frozen, or its load never ended.
     log(`  AI check, step ${i + 1}: the page hasn't answered for ${secs} s`);
     return refresh(`the page hasn't answered for ${secs} s`);
@@ -1522,17 +1563,23 @@ async function aiJudge(lead, ctl, t, i, id, ms, stuck = true) {
     if (tab && pageOf(tab.url) === snap.url) return { action: "logout", why: `the tab is on ${snap.url}, none of ${aiConfig.allowedPages}${a.reason ? ` (${a.reason})` : ""}`, pageRule: true };
   }
   if (!stuck) return null;
-  if (a.page === "expected" && !a.stuck) return null;
   const why = `the AI sees ${AI_SEES[a.page]}${a.stuck && a.page === "expected" ? ", stuck" : ""}${a.reason ? ` (${a.reason})` : ""}`;
-  if (a.page === "home" && a.signedIn) return { action: "logout", why };
-  // Before the task got going (up to a few steps past Register): off the
-  // goal page, go there; on it but signed in, log out. Once per step.
+  // Before the task got going (up to a few steps past Register): signed in
+  // on the goal page means Register can't work there: log out, start again.
   const gs = goalStep(steps);
-  if (gs >= 0 && (steps[gs].tab || 0) === (st.tab || 0) && i <= gs + PLACE_BACK && !ctl.aiGoal.get(i)) {
-    const name = aiConfig.goalLink;
-    if (!a.onGoal) return { action: "goal", why: `${why}, not the ${name} page` };
-    if (a.signedIn) return { action: "logout", why: `${why}, signed in on the ${name} page` };
+  const nearGoal = gs >= 0 && (steps[gs].tab || 0) === (st.tab || 0) && i <= gs + PLACE_BACK;
+  if (nearGoal && a.onGoal && a.signedIn) return { action: "logout", why: `${why}: signed in on the ${aiConfig.goalLink} page` };
+  if (a.page === "expected" && !a.stuck) return null;
+  if (a.page === "home" && a.signedIn) return { action: "logout", why };
+  // On the very page the tape did this step on: the AI's name for the page
+  // ("login" for a sign-up form, "start") is no reason to start over. Only
+  // stuck, signed in, or another address is.
+  if (snap && st.page && snap.url === st.page && !a.stuck) {
+    log(`  Step ${i + 1}: the tab is on the step's own page (${snap.url}); not starting over for "${a.page}"`);
+    return null;
   }
+  // Off the goal page before the task got going: go there. Once per step.
+  if (nearGoal && !ctl.aiGoal.get(i) && !a.onGoal) return { action: "goal", why: `${why}, not the ${aiConfig.goalLink} page` };
   if ((a.page === "start" || a.page === "login") && !a.stuck) {
     // Back where the tab began, in the middle of the run: start over. Still
     // on this tab's first step: that's where it should be.
@@ -1563,8 +1610,9 @@ async function aiWatch(lead, ctl, t) {
       ctl.aiWarned = true;
     }
     if (!verdict || over()) continue;
-    // A verdict on a stuck step: only while that step still waits.
-    if (ctl.cur === cur) kick(ctl, verdict);
+    // A verdict on a stuck step: only while that step still waits (a
+    // click-again in between makes a new try of the same step).
+    if (ctl.cur && ctl.cur.i === cur.i && ctl.cur.id === cur.id) kick(ctl, verdict);
     // The page rule is about the tab, not the step: act on it at once.
     else if (verdict.pageRule) {
       if (ctl.cur) kick(ctl, verdict);
@@ -1645,7 +1693,14 @@ async function ensureStartState(lead, ctl, t, group, slots, steps) {
     // With a goal page set for this tab, don't wait long: going there is quick.
     const gs = goalStep(steps);
     const toGoal = gs >= 0 && (steps[gs].tab || 0) === s;
-    const forced = ctl.resetSlots.delete(s);
+    let forced = ctl.resetSlots.delete(s);
+    // "Go to Trade" on the goal page in place of Register: this account is
+    // done and signed in. Log out now, no waiting for Register.
+    const done = toGoal && !forced && (await pageHasText(id, aiConfig.signedInText));
+    if (done) {
+      log(`  Tab ${s + 1} shows "${aiConfig.signedInText}": already signed up and signed in`);
+      forced = true;
+    }
     if (!forced && (await here(id, k, toGoal ? 3000 : START_WAIT_MS))) {
       // The first step's element can show on a signed-in home page too: the
       // AI looks, while the run goes on.
@@ -1653,7 +1708,7 @@ async function ensureStartState(lead, ctl, t, group, slots, steps) {
       continue;
     }
     const what = steps[k].target.text ? `"${steps[k].target.text.slice(0, 40)}"` : "its first button or field";
-    sendGroup(lead, { type: "warn", text: forced ? `Tab ${s + 1}: still signed in after the last run. Resetting it.` : `Tab ${s + 1} doesn't look like the start of the recording (${what} isn't there). Resetting it.` });
+    sendGroup(lead, { type: "warn", text: done ? `Tab ${s + 1} shows "${aiConfig.signedInText}": logging out.` : forced ? `Tab ${s + 1}: still signed in after the last run. Resetting it.` : `Tab ${s + 1} doesn't look like the start of the recording (${what} isn't there). Resetting it.` });
     // A popup in the way?
     const r0 = await sendWithTimeout(id, { type: "unblock" }, 15000).catch(() => null);
     if (r0 && r0.done && r0.done.length) {
@@ -1661,7 +1716,7 @@ async function ensureStartState(lead, ctl, t, group, slots, steps) {
       if (!forced && (await here(id, k, 3000))) continue;
     }
     // The goal page (8th Anniversary): click its link, or load the start page.
-    if (toGoal) {
+    if (toGoal && !done) {
       await goToGoal(lead, ctl, id, slots[s].startUrl);
       if (await here(id, k, 5000)) {
         log(`  Tab ${s + 1} is at the start (the ${aiConfig.goalLink} page)`);
@@ -1793,9 +1848,11 @@ async function startPlayback(tabId, resumed, again = null) {
     nextKick: null, // a verdict (start check, code rule) for the next step
     codeSent: null, // { s, id, at, seen }: the tape's Send was pressed, the code not typed yet
     codeTicking: false, // the countdown runs at codeMin or more
+    codeDone: new Map(), // tabId -> when a code went in there
     aiGoal: new Map(), // step index -> went to the goal page for it
     aiAgain: new Map(), // step index -> clicks of the step before it, again (clickWatch)
     refs: new Map(), // tabId -> { url, state, form, tries }: the referral fill on that page
+    stepSince: new Map(), // step index -> when this run first tried it
     refSkip: new Set(), // the tape's referral steps (the fill does them)
     steps: null, // the tape's steps, for goToGoal
     aiReloads: new Map(), // step index -> reloads the AI check asked for in this run
@@ -1808,7 +1865,7 @@ async function startPlayback(tabId, resumed, again = null) {
   if (aiConfig.referralCode) ctl.refSkip = referralSteps(t.tape.steps);
   aiWatch(tabId, ctl, t).catch((e) => log(`AI check stopped: ${(e && e.message) || e}`));
   clickWatch(tabId, ctl, t).catch((e) => log(`Click check stopped: ${(e && e.message) || e}`));
-  if (t.tape.steps.some(isSendStep)) codeWatch(tabId, ctl, t).catch((e) => log(`Code rule stopped: ${(e && e.message) || e}`));
+  codeWatch(tabId, ctl, t).catch((e) => log(`Code rule stopped: ${(e && e.message) || e}`));
   t.mode = "playing";
   t.error = "";
   let error = "";
@@ -2125,7 +2182,10 @@ async function startPlayback(tabId, resumed, again = null) {
         }
         await ensureReferral(ctl, target);
         ctl.kick = null; // a verdict on an earlier step
-        ctl.cur = { i, id: target, since: Date.now() };
+        // since: the first try at this step in this run (click-agains don't
+        // reset the AI's clock); at: this try (clickWatch's clock).
+        if (!ctl.stepSince.has(i)) ctl.stepSince.set(i, Date.now());
+        ctl.cur = { i, id: target, since: ctl.stepSince.get(i), at: Date.now() };
         let res = await performStep(target, ctl, msg);
         if (res && res.ok && typeof res.copied === "string" && res.copied) setClip(ctl, res.copied, target);
         if (res && res.ok && (step.copies || step.type === "copy") && !ctl.cancelled && !ctl.kick) {
@@ -2165,7 +2225,7 @@ async function startPlayback(tabId, resumed, again = null) {
             // the code rule may start over (codeWatch). A reload would throw
             // the form and its timer away. Try the step again; a mail tab gets
             // a reload first, so a new email shows.
-            const sendSlot = steps[ctl.codeSent.s].tab || 0;
+            const sendSlot = ctl.codeSent.slot;
             log(`  ${what}. The code timer is still running: trying the step again`);
             if ((step.tab || 0) !== sendSlot) await reloadStuck(tabId, target, ctl);
             else await sleep(500, ctl);
@@ -2187,9 +2247,10 @@ async function startPlayback(tabId, resumed, again = null) {
         if (i >= (ctl.shakyUntil ?? -1)) ctl.shakyUntil = -1; // past the trouble
         // The code rule: from Send pressed until the code is typed or pasted in its tab.
         if (isSendStep(step)) {
-          ctl.codeSent = { s: i, id: target, at: Date.now(), seen: false };
+          ctl.codeSent = { s: i, id: target, slot: step.tab || 0, at: Date.now(), seen: false };
           ctl.codeTicking = false;
-        } else if (ctl.codeSent && i > ctl.codeSent.s && (step.type === "input" || step.type === "paste") && (step.tab || 0) === (steps[ctl.codeSent.s].tab || 0)) {
+        } else if (ctl.codeSent && i > ctl.codeSent.s && (step.type === "input" || step.type === "paste") && (step.tab || 0) === ctl.codeSent.slot) {
+          ctl.codeDone.set(ctl.codeSent.id, Date.now()); // the code went in
           ctl.codeSent = null;
           ctl.codeTicking = false;
         }
@@ -2218,6 +2279,7 @@ async function startPlayback(tabId, resumed, again = null) {
       ctl.aiReloads.clear();
       ctl.aiGoal.clear();
       ctl.aiAgain.clear();
+      ctl.stepSince.clear();
       ctl.codeSent = null;
       t.play.index = 0;
       t.play.run += 1;
