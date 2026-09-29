@@ -186,7 +186,7 @@ function releaseMember(id) {
 // and a note meaning "the last tape" gave a tab the wrong tape back once
 // another file was opened.
 const savedTapes = new Set();
-const tapeKey = (tape) => `tape:${tape.createdAt}:${tape.steps.length}`;
+const tapeKey = (tape) => `tape:${tape.createdAt}:${tape.steps.length}:${tape.rev || 0}`;
 
 function getTab(tabId) {
   let t = tabs.get(tabId);
@@ -1273,7 +1273,7 @@ function aiJob(t, i, snap, question) {
 
 // The page rule applies in the tab of the goal page (not a mail tab, say).
 function pageRuleOn(t, st) {
-  if (!aiConfig.pageRule || !aiConfig.allowedPages || !st) return false;
+  if (!aiConfig.pageRule || !aiConfig.allowedPages || !st || !pagesKnown(t.tape)) return false;
   const gs = goalStep(t.tape.steps);
   return gs >= 0 && (t.tape.steps[gs].tab || 0) === (st.tab || 0);
 }
@@ -1311,6 +1311,56 @@ function goalStep(steps) {
   if (!aiConfig.goalLink || !want) return -1;
   // "Register" matches "Register Now" too.
   return steps.findIndex((st) => PLACE_TYPES.has(st.type) && st.target && String(st.target.text || "").trim().toLowerCase().includes(want));
+}
+
+// Whether the tape knows the page of each step it can place (recorded with
+// 2.0.2 or later, or learned by a run: see the step loop). Rules that
+// compare pages wait for it; guessing logged out on a password page.
+function pagesKnown(tape) {
+  return tape.steps.every((st) => !PLACE_TYPES.has(st.type) || !st.target || !!st.page);
+}
+
+// The first step of tab slot `slot` a page can show, or -1.
+function firstStepOf(steps, slot) {
+  for (let j = 0; j < steps.length; j++) {
+    if ((steps[j].tab || 0) !== slot) continue;
+    if (steps[j].type === "nav" && steps[j].kind === "reload") continue; // same page, same sign-in
+    if (steps[j].type === "nav") return -1;
+    if (PLACE_TYPES.has(steps[j].type) && steps[j].target && !["html", "body"].includes(steps[j].target.tag)) return j;
+  }
+  return -1;
+}
+
+// Whether the goal button is where the tape starts in its tab (the task
+// begins on the goal page), rather than later (Register Now after a sign-up).
+function goalAtStart(steps) {
+  const gs = goalStep(steps);
+  if (gs < 0) return false;
+  const k = firstStepOf(steps, steps[gs].tab || 0);
+  return k >= 0 && gs - k <= 1;
+}
+
+// Whether step i is about the goal page: before and around it when the task
+// starts there, else just around the goal step.
+function nearGoal(steps, i) {
+  const gs = goalStep(steps);
+  if (gs < 0 || (steps[gs].tab || 0) !== (steps[i].tab || 0)) return false;
+  return i <= gs + PLACE_BACK && (goalAtStart(steps) || i >= gs - 1);
+}
+
+// Where goToGoal loads the goal page when no link to it shows: the page the
+// tape pressed the goal button on, else the start page when that is the goal.
+function goalUrl(t) {
+  const steps = t.tape.steps;
+  const gs = goalStep(steps);
+  if (gs < 0) return "";
+  if (steps[gs].page) return steps[gs].page;
+  return goalAtStart(steps) ? (tapeTabs(t.tape)[steps[gs].tab || 0] || {}).startUrl || "" : "";
+}
+
+// Whether the tape logs out in tab slot `slot` (then each run starts signed out).
+function logsOutIn(steps, slot) {
+  return steps.some((st) => (st.tab || 0) === slot && PLACE_TYPES.has(st.type) && st.target && SIGN_OUT.test(String(st.target.text || "").trim()));
 }
 
 // Gets tab id to the goal page: clicks the goalLink link there, else loads
@@ -1373,11 +1423,18 @@ async function clickWatch(lead, ctl, t) {
     const cur = ctl.cur;
     if (over() || !cur || ctl.kick || ctl.nextKick || t.settings.recover === false) continue;
     if (Date.now() - cur.at < 1500) continue;
-    if (ctl.codeSent && ctl.codeTicking) continue; // the code is on its way
     const i = cur.i;
+    // Sent to the home page while this step waits: go to the goal page, carry on.
+    if (aiConfig.goalLink && !ctl.aiGoal.get(i) && (await onHomePage(t, i, cur.id))) {
+      const tab = await chrome.tabs.get(cur.id).catch(() => null);
+      if (!over() && ctl.cur && ctl.cur.i === i) kick(ctl, { action: "goal", why: `the tab is on the home page (${tab ? pageOf(tab.url) : "?"})` });
+      continue;
+    }
+    if (ctl.codeSent && ctl.codeTicking) continue; // the code is on its way
     // "Go to Trade" in place of Register on the goal page: signed in. Log out.
     const gs = goalStep(steps);
-    if (gs >= 0 && aiConfig.signedInText && (steps[gs].tab || 0) === (steps[i].tab || 0) && i <= gs + PLACE_BACK && (await pageHasText(cur.id, aiConfig.signedInText))) {
+    const atGoal = gs >= 0 && (i === gs || (goalAtStart(steps) && i <= gs + 1));
+    if (atGoal && aiConfig.signedInText && (await pageHasText(cur.id, aiConfig.signedInText))) {
       if (!over() && ctl.cur && ctl.cur.i === i) kick(ctl, { action: "logout", why: `"${aiConfig.signedInText}" shows where "${aiConfig.goalButton}" should be: already signed up and signed in` });
       continue;
     }
@@ -1459,6 +1516,39 @@ async function ensureReferral(ctl, id) {
   ctl.refs.set(id, { url, state: r.state, form: !!r.form, tries: same ? was.tries + 1 : 1 });
   if (r.state === "done") log(`  Referral code ${code} filled in${r.opened ? ` (opened "${r.opened}")` : ""}`);
   else if (r.state === "filled" && !same) log(`  Referral field already holds "${r.value}": left as it is`);
+}
+
+// ---------- the home page ----------
+// A site's home page (bitrue.com/, bitrue.com/en, /en-US/) in the middle of
+// the task means the site sent the tab there, signed in (after a sign-up, a
+// time-out). Log out before anything else, then start again. Not where the
+// tape itself works on a home page (a mail site's inbox is its home page).
+
+const LOCALE = /^[a-z]{2}([-_][a-z]{2,4})?$/i;
+function isHome(url) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch (_) {
+    return false;
+  }
+  if (!/^https?:$/.test(u.protocol)) return false;
+  const parts = u.pathname.split("/").filter(Boolean);
+  return !parts.length || (parts.length === 1 && (LOCALE.test(parts[0]) || /^index(\.\w+)?$/i.test(parts[0])));
+}
+
+// Whether tab id shows a home page where step i isn't one.
+async function onHomePage(t, i, id) {
+  const st = t.tape.steps[i];
+  if (!st || !st.page || isHome(st.page) || navPending.get(id)) return false; // no page known: don't guess
+  const tab = await chrome.tabs.get(id).catch(() => null);
+  return !!(tab && isHome(tab.url));
+}
+
+// Whether tab id's page has a log out / sign out control (signed in).
+async function pageSignedIn(id) {
+  const r = await sendWithTimeout(id, { type: "signedIn" }, 4000).catch(() => null);
+  return !!(r && r.ok && r.found);
 }
 
 // Whether text shows in tab id ("Go to Trade" on the goal page).
@@ -1594,11 +1684,18 @@ async function aiJudge(lead, ctl, t, i, id, ms, stuck = true) {
   const why = `the AI sees ${AI_SEES[a.page]}${a.stuck && a.page === "expected" ? ", stuck" : ""}${a.reason ? ` (${a.reason})` : ""}`;
   // Before the task got going (up to a few steps past Register): signed in
   // on the goal page means Register can't work there: log out, start again.
-  const gs = goalStep(steps);
-  const nearGoal = gs >= 0 && (steps[gs].tab || 0) === (st.tab || 0) && i <= gs + PLACE_BACK;
-  if (nearGoal && a.onGoal && a.signedIn) return { action: "logout", why: `${why}: signed in on the ${aiConfig.goalLink} page` };
+  const onGoalSteps = nearGoal(steps, i);
+  if (onGoalSteps && goalAtStart(steps) && a.onGoal && a.signedIn) return { action: "logout", why: `${why}: signed in on the ${aiConfig.goalLink} page` };
   if (a.page === "expected" && !a.stuck) return null;
-  if (a.page === "home" && a.signedIn) return { action: "logout", why };
+  if (a.page === "home" && a.signedIn) {
+    // Signed in on the home page with the goal page still ahead in the tape
+    // (after the sign-up: 8th Anniversary, Register, log out): go there and
+    // carry on. Else log out and start again.
+    const want = aiConfig.goalButton.toLowerCase();
+    const ahead = !!want && aiConfig.goalLink && steps.some((x, j) => j > i && (x.tab || 0) === (st.tab || 0) && x.target && String(x.target.text || "").toLowerCase().includes(want));
+    if (ahead && !ctl.aiGoal.get(i)) return { action: "goal", why };
+    return { action: "logout", why };
+  }
   // On the very page the tape did this step on: the AI's name for the page
   // ("login" for a sign-up form, "start") is no reason to start over. Only
   // stuck, signed in, or another address is.
@@ -1607,7 +1704,7 @@ async function aiJudge(lead, ctl, t, i, id, ms, stuck = true) {
     return null;
   }
   // Off the goal page before the task got going: go there. Once per step.
-  if (nearGoal && !ctl.aiGoal.get(i) && !a.onGoal) return { action: "goal", why: `${why}, not the ${aiConfig.goalLink} page` };
+  if (onGoalSteps && !ctl.aiGoal.get(i) && !a.onGoal) return { action: "goal", why: `${why}, not the ${aiConfig.goalLink} page` };
   if ((a.page === "start" || a.page === "login") && !a.stuck) {
     // Back where the tab began, in the middle of the run: start over. Still
     // on this tab's first step: that's where it should be.
@@ -1710,6 +1807,9 @@ async function ensureStartState(lead, ctl, t, group, slots, steps) {
     let k = -1;
     for (let j = 0; j < steps.length; j++) {
       if ((steps[j].tab || 0) !== s) continue;
+      // A reload keeps the page and its sign-in: look past it. (A tape that
+      // began with one skipped this whole check, signed in or not.)
+      if (steps[j].type === "nav" && steps[j].kind === "reload") continue;
       if (steps[j].type === "nav") break;
       if (fits(j)) {
         k = j;
@@ -1720,15 +1820,24 @@ async function ensureStartState(lead, ctl, t, group, slots, steps) {
     const id = group[s];
     // With a goal page set for this tab, don't wait long: going there is quick.
     const gs = goalStep(steps);
-    const toGoal = gs >= 0 && (steps[gs].tab || 0) === s;
+    const toGoal = gs >= 0 && (steps[gs].tab || 0) === s && goalAtStart(steps);
     let forced = ctl.resetSlots.delete(s);
-    // "Go to Trade" on the goal page in place of Register: this account is
-    // done and signed in. Log out now, no waiting for Register.
-    const done = toGoal && !forced && (await pageHasText(id, aiConfig.signedInText));
-    if (done) {
-      log(`  Tab ${s + 1} shows "${aiConfig.signedInText}": already signed up and signed in`);
-      forced = true;
-    }
+    // On the site's home page, or "Go to Trade" on the goal page in place of
+    // Register (this account is done and signed in): log out now, before
+    // anything else, no waiting for Register.
+    const tabNow = await chrome.tabs.get(id).catch(() => null);
+    const homeOk = steps[k].page ? isHome(steps[k].page) : isHome(slots[s].startUrl || "");
+    const atHome = !!(tabNow && isHome(tabNow.url) && !homeOk);
+    const trade = !atHome && toGoal && !forced && (await pageHasText(id, aiConfig.signedInText));
+    // Still signed in from the last run (a log out button on the page, even
+    // in a closed account menu): log out before anything else. A run that
+    // restarted signed in used to loop on the home page.
+    const signedIn = !atHome && !trade && (toGoal || logsOutIn(steps, s)) && !forced && (await pageSignedIn(id));
+    const done = atHome || trade || signedIn;
+    if (atHome) log(`  Tab ${s + 1} is on the home page (${tabNow.url}): logging out first`);
+    else if (trade) log(`  Tab ${s + 1} shows "${aiConfig.signedInText}": already signed up and signed in`);
+    else if (signedIn) log(`  Tab ${s + 1} is still signed in (a log out button is on the page): logging out first`);
+    if (done) forced = true;
     if (!forced && (await here(id, k, toGoal ? 3000 : START_WAIT_MS))) {
       // The first step's element can show on a signed-in home page too: the
       // AI looks, while the run goes on.
@@ -1736,7 +1845,7 @@ async function ensureStartState(lead, ctl, t, group, slots, steps) {
       continue;
     }
     const what = steps[k].target.text ? `"${steps[k].target.text.slice(0, 40)}"` : "its first button or field";
-    sendGroup(lead, { type: "warn", text: done ? `Tab ${s + 1} shows "${aiConfig.signedInText}": logging out.` : forced ? `Tab ${s + 1}: still signed in after the last run. Resetting it.` : `Tab ${s + 1} doesn't look like the start of the recording (${what} isn't there). Resetting it.` });
+    sendGroup(lead, { type: "warn", text: atHome ? `Tab ${s + 1} is on the home page: logging out first.` : trade ? `Tab ${s + 1} shows "${aiConfig.signedInText}": logging out.` : signedIn ? `Tab ${s + 1} is still signed in: logging out first.` : forced ? `Tab ${s + 1}: still signed in after the last run. Resetting it.` : `Tab ${s + 1} doesn't look like the start of the recording (${what} isn't there). Resetting it.` });
     // A popup in the way?
     const r0 = await sendWithTimeout(id, { type: "unblock" }, 15000).catch(() => null);
     if (r0 && r0.done && r0.done.length) {
@@ -1745,7 +1854,7 @@ async function ensureStartState(lead, ctl, t, group, slots, steps) {
     }
     // The goal page (8th Anniversary): click its link, or load the start page.
     if (toGoal && !done) {
-      await goToGoal(lead, ctl, id, slots[s].startUrl);
+      await goToGoal(lead, ctl, id, goalUrl(t));
       if (await here(id, k, 5000)) {
         log(`  Tab ${s + 1} is at the start (the ${aiConfig.goalLink} page)`);
         continue;
@@ -2089,7 +2198,7 @@ async function startPlayback(tabId, resumed, again = null) {
       }
       if (k.action === "goal") {
         ctl.aiGoal.set(i, true);
-        await goToGoal(tabId, ctl, id, (slots[slot] || {}).startUrl);
+        await goToGoal(tabId, ctl, id, goalUrl(t));
         say(tabId, "Finding the place in the recording");
         goTo = await findPlace(steps, i, id, ctl);
         say(tabId, "");
@@ -2209,6 +2318,14 @@ async function startPlayback(tabId, resumed, again = null) {
           await onKick(i, target);
           break;
         }
+        if (recoverOn() && !ctl.aiGoal.get(i) && aiConfig.goalLink && (await onHomePage(t, i, target))) {
+          // Sent to the home page (after the sign-up, say): go to the goal page
+          // and carry on from the step that fits there (Register, then log out).
+          const tab = await chrome.tabs.get(target).catch(() => null);
+          ctl.kick = { action: "goal", why: `the tab is on the home page (${tab ? pageOf(tab.url) : "?"})` };
+          await onKick(i, target);
+          break;
+        }
         await ensureReferral(ctl, target);
         ctl.kick = null; // a verdict on an earlier step
         // since: the first try at this step in this run (click-agains don't
@@ -2274,6 +2391,12 @@ async function startPlayback(tabId, resumed, again = null) {
           sendGroup(tabId, { type: "warn", text: what + " (skipped)" });
         }
         if (i >= (ctl.shakyUntil ?? -1)) ctl.shakyUntil = -1; // past the trouble
+        // A tape from before 2.0.2 doesn't know its pages: learn them as it
+        // plays, from where each step acted.
+        if (!step.page && step.target && PLACE_TYPES.has(step.type) && res && res.ok && pageOf(res.page || "")) {
+          step.page = pageOf(res.page);
+          t.tapeDirty = true; // saved when a whole run goes through
+        }
         // The code rule: from Send pressed until the code is typed or pasted in its tab.
         if (isSendStep(step)) {
           ctl.codeSent = { s: i, id: target, slot: step.tab || 0, at: Date.now(), seen: false };
@@ -2304,6 +2427,16 @@ async function startPlayback(tabId, resumed, again = null) {
         continue;
       }
       t.restarts = 0; // a whole run went through
+      if (t.tapeDirty) {
+        // Keep what the runs learned: the tape now knows its pages (Save
+        // writes them to the file too), and the page rules can work.
+        t.tapeDirty = false;
+        t.tape.rev = (t.tape.rev || 0) + 1;
+        rememberTape(t.tape);
+        const known = t.tape.steps.filter((st) => st.page).length;
+        log(`The tape now knows the page of ${known} steps${pagesKnown(t.tape) ? " (all it needs)" : " (some still to learn)"}; saved`);
+        persist(tabId, true);
+      }
       log(`Run ${t.play.run} done${ctl.runAt ? ` in ${Math.round((Date.now() - ctl.runAt) / 1000)} s` : ""}`);
       ctl.tries.clear();
       ctl.aiReloads.clear();

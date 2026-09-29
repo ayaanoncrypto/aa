@@ -99,6 +99,13 @@
       case "codeTimer":
         reply({ ok: true, ...TT.sense.codeTimer() });
         return;
+      case "signedIn":
+        try {
+          reply({ ok: true, found: TT.sense.signOutControls().length > 0 });
+        } catch (_) {
+          reply({ ok: false });
+        }
+        return;
       case "hasText":
         reply({ ok: true, found: TT.sense.hasText(String(msg.text || "")) });
         return;

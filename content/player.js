@@ -650,11 +650,16 @@
       return el;
     };
     cursor.show(msg.from);
-    const done = (extra = {}) => ({ ok: true, x: cursor.x, y: cursor.y, hidden: TT.hidden(), ...extra });
+    // page: where the step acted (the worker learns a tape's pages from it).
+    let actedOn = "";
+    const done = (extra = {}) => ({ ok: true, x: cursor.x, y: cursor.y, hidden: TT.hidden(), page: actedOn, ...extra });
     // missing: the page answered but the recorded element isn't on it.
     const fail = (error, extra = {}) => ({ ok: false, error, x: cursor.x, y: cursor.y, hidden: TT.hidden(), ...extra });
     const lost = { missing: true };
-    const acted = () => TT.send({ type: "acted", i: msg.i }).catch(() => {});
+    const acted = () => {
+      actedOn = location.origin + location.pathname;
+      return TT.send({ type: "acted", i: msg.i }).catch(() => {});
+    };
 
     switch (step.type) {
       case "click":
