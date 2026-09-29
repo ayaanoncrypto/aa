@@ -118,7 +118,29 @@ const ready = (async () => {
     }
     applyBadge(id);
   }
+  autoRestart("TinyTab's worker restarted");
 })();
+
+// ---------- keep playing ----------
+// Play stays on until Stop is pressed (t.auto). Playback that stopped any other
+// way, or a "Playing again in ..." wait that got lost (Chrome stopped the
+// worker during it), starts again: now, and checked every minute (alarm).
+function autoRestart(why) {
+  for (const [id, t] of tabs) {
+    if (!t.auto || !t.on || t.mode !== "idle" || t.link != null || replays.has(id) || players.has(id)) continue;
+    if (!t.tape.steps.length && lastTape) t.tape = structuredClone(lastTape); // load the tape again
+    if (!t.tape.steps.length) continue;
+    log(`${why}: playback had stopped without Stop being pressed. Playing again.`);
+    t.play = { index: 0, run: t.lastRun || 1 };
+    startPlayback(id, false, t.group ? { group: t.group } : { group: [id] });
+  }
+}
+chrome.alarms.create("tinytab-keep-playing", { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener(async (a) => {
+  if (a.name !== "tinytab-keep-playing") return;
+  await ready;
+  autoRestart("Minute check");
+});
 
 function newTab() {
   return {
@@ -401,6 +423,7 @@ async function setOn(tabId, on) {
     }
     t.on = false;
     t.mode = "idle";
+    t.auto = false; // turned off: no playing again
   }
   persist(tabId, true);
   notify(tabId);
@@ -1424,6 +1447,18 @@ async function clickWatch(lead, ctl, t) {
     if (over() || !cur || ctl.kick || ctl.nextKick || t.settings.recover === false) continue;
     if (Date.now() - cur.at < 1500) continue;
     const i = cur.i;
+    // A popup in the way (the one after Register Now): close it, every 2 s at
+    // most. The step goes on by itself; a click it covered gets pressed again below.
+    if (Date.now() - (ctl.unblockedAt || 0) >= 2000) {
+      ctl.unblockedAt = Date.now();
+      const r = await sendWithTimeout(cur.id, { type: "unblock" }, 8000).catch(() => null);
+      if (r && Array.isArray(r.done) && r.done.length) {
+        log(`  Step ${i + 1}: closed a popup in the way (${r.done.join(", ")})`);
+        ctl.aiAgain.delete(i); // the click it covered may be pressed again
+        cur.at = Date.now() - AGAIN_AFTER_MS + 800; // soon
+        continue;
+      }
+    }
     // Sent to the home page while this step waits: go to the goal page, carry on.
     if (aiConfig.goalLink && !ctl.aiGoal.get(i) && (await onHomePage(t, i, cur.id))) {
       const tab = await chrome.tabs.get(cur.id).catch(() => null);
@@ -1571,6 +1606,7 @@ async function codeWatch(lead, ctl, t) {
       // No Send pressed: a page that sent the code by itself (code boxes and
       // "21 S" under them, after Next). Watch it the same way. Not in a tab
       // where the code went in during the last minute (the page may linger).
+      let sendOnly = null;
       for (const [slot, id] of (ctl.group || []).entries()) {
         if (Date.now() - (ctl.codeDone.get(id) || 0) < 60000) continue;
         const r = await sendWithTimeout(id, { type: "codeTimer" }, 4000).catch(() => null);
@@ -1579,8 +1615,26 @@ async function codeWatch(lead, ctl, t) {
           log(`  Code page in tab ${slot + 1}: watching its timer`);
           break;
         }
+        // A code page that shows "Send" (or "Resend") and no countdown: the
+        // code didn't go. Unless the tape presses Send itself further on.
+        const sendAhead = steps.some((st, j) => j >= t.play.index && (st.tab || 0) === slot && isSendStep(st));
+        if (r && r.ok && r.codeBox && r.send && !sendAhead) sendOnly = { id, slot, label: r.send };
       }
-      if (!w) continue;
+      if (!w) {
+        if (!sendOnly) {
+          ctl.sendOnlySince = null;
+          continue;
+        }
+        const was = ctl.sendOnlySince;
+        if (!was || was.id !== sendOnly.id) ctl.sendOnlySince = { id: sendOnly.id, at: Date.now() };
+        else if (Date.now() - was.at >= 4000) {
+          ctl.sendOnlySince = null;
+          const verdict = { action: "restart", why: `the code page shows "${sendOnly.label}" and no countdown: the code wasn't sent` };
+          if (ctl.cur) kick(ctl, verdict);
+          else ctl.nextKick = verdict;
+        }
+        continue;
+      }
     }
     const r = await sendWithTimeout(w.id, { type: "codeTimer" }, 4000).catch(() => null);
     if (!r || !r.ok || ctl.codeSent !== w || over()) continue;
@@ -1900,7 +1954,10 @@ async function ensureStartState(lead, ctl, t, group, slots, steps) {
 
 async function togglePlay(tabId) {
   const t = getTab(tabId);
-  if (t.mode === "playing") return stopPlayback(tabId);
+  if (t.mode === "playing") {
+    t.auto = false; // Stop pressed
+    return stopPlayback(tabId);
+  }
   if (t.mode === "recording") stopRecording(tabId);
   if (t.link != null) return;
   if (!t.tape.steps.length) {
@@ -1909,6 +1966,9 @@ async function togglePlay(tabId) {
     return;
   }
   t.play = { index: 0, run: 1 };
+  // Play pressed: keep playing until Stop is pressed. Playback that stops any
+  // other way (an error, a lost wait, a worker restart) starts again.
+  t.auto = true;
   startPlayback(tabId, false);
 }
 
@@ -2467,9 +2527,14 @@ async function startPlayback(tabId, resumed, again = null) {
       }
       delete t.group;
       if (!ctl.cancelled && tabs.has(tabId)) {
+        const runWas = t.play.run;
         t.mode = "idle";
         t.play = { index: 0, run: 1 };
-        t.error = replay && !error ? playAgainLater(tabId, group, replay) : error;
+        t.lastRun = runWas;
+        // Stopped by an error, not by Stop: with Play still on, play again.
+        if (error && t.auto && t.settings.recover !== false) replay = { why: `Stopped by an error (${error})`, run: runWas, reset: [...ctl.resetSlots] };
+        else if (!replay) t.auto = false; // finished (repeat count reached)
+        t.error = replay ? playAgainLater(tabId, group, replay) : error;
         log(t.error ? `Stopped: ${t.error}` : "Finished");
         persist(tabId, true);
         notify(tabId);
@@ -2507,6 +2572,7 @@ function playAgainLater(tabId, group, { why, run, reset }) {
     if (w.cancelled || replays.get(tabId) !== w) return;
     replays.delete(tabId);
     const now = tabs.get(tabId);
+    if (now && !now.tape.steps.length && lastTape) now.tape = structuredClone(lastTape); // load the tape again
     if (!now || !now.on || now.mode !== "idle" || !now.tape.steps.length) {
       for (const id of group) letSleep(id);
       return;
@@ -2640,17 +2706,20 @@ async function command(tabId, t, msg) {
   }
   switch (msg.action) {
     case "record":
+      t.auto = false;
       await toggleRecord(tabId, msg.url);
       break;
     case "play":
       await togglePlay(tabId);
       break;
     case "stop":
+      t.auto = false;
       cancelReplay(tabId);
       if (t.mode === "playing") stopPlayback(tabId);
       if (t.mode === "recording") stopRecording(tabId);
       break;
     case "off":
+      t.auto = false;
       cancelReplay(tabId);
       await setOn(tabId, false);
       break;
@@ -2669,6 +2738,7 @@ async function command(tabId, t, msg) {
       break;
     case "load": {
       if (t.mode !== "idle") return { ok: false, error: "Stop first, then open a tape." };
+      t.auto = false;
       cancelReplay(tabId);
       t.tape = cleanTape(msg.tape);
       t.error = "";
@@ -2690,7 +2760,8 @@ async function command(tabId, t, msg) {
       return { ok: true, tape };
     }
     case "dismiss":
-      cancelReplay(tabId); // closing "Playing again in ..." cancels that Play
+      if (replays.has(tabId)) t.auto = false; // closing "Playing again in ..." cancels that Play
+      cancelReplay(tabId);
       t.error = "";
       persist(tabId);
       break;

@@ -123,7 +123,25 @@
   const DECLINE = /^(reject all|reject|decline( all)?|refuse( all)?|deny( all)?|only necessary|necessary only|essential only|use necessary cookies only|accept (only )?(essential|necessary)( cookies)?( only)?|continue without accepting)$/i;
   // Words that close a popup without doing anything ("Cancel" can undo work; not here).
   const CLOSE_TEXT = /^(×|✕|✖|x|close|dismiss|no thanks|no, thanks|not now|maybe later|later|skip|got it)$/i;
-  const CLOSE_HINT = /(close|dismiss|关闭|閉じる|schließen|fermer|cerrar|chiudi|fechar|закрыть)/i;
+  const CLOSE_HINT = /(close|dismiss|guanbi|icon-x\b|cross|关闭|閉じる|schließen|fermer|cerrar|chiudi|fechar|закрыть)/i;
+  const classOf = (el) => el.getAttribute("class") || ""; // an <svg>'s className isn't a string
+
+  // The X of a popup drawn as an icon with no name: a small box at the top
+  // right corner of the popup's panel.
+  function cornerX(box) {
+    for (const el of box.querySelectorAll("button, a, span, div, i, svg, img")) {
+      const r = el.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8 || r.width > 48 || r.height > 48 || !TT.isVisible(el)) continue;
+      if (clean(el.textContent).replace(/[×✕✖xX]/g, "").length) continue;
+      for (let a = el.parentElement, d = 0; a && d < 5 && box.contains(a); a = a.parentElement, d++) {
+        const ar = a.getBoundingClientRect();
+        if (ar.width < 200) continue;
+        if (r.right >= ar.right - 64 && r.top <= ar.top + 64) return el.closest("button, a, [role='button']") || el;
+        break;
+      }
+    }
+    return null;
+  }
 
   // Boxes on top of the page: a dialog, or a fixed box over a good part of the
   // screen (a newsletter popup, a cookie banner). A site's own sticky header isn't one.
@@ -158,7 +176,8 @@
         const btns = Array.from(box.querySelectorAll('button, a, [role="button"], span, div, i, svg')).filter((b) => TT.isVisible(b) && !leaves(b));
         const pick =
           btns.find((b) => DECLINE.test(shortText(b))) ||
-          btns.find((b) => CLOSE_TEXT.test(shortText(b)) || CLOSE_HINT.test(hintOf(b)) || /(^|[-_ ])close([-_ ]|$)/i.test(typeof b.className === "string" ? b.className : ""));
+          btns.find((b) => CLOSE_TEXT.test(shortText(b)) || CLOSE_HINT.test(hintOf(b)) || CLOSE_HINT.test(classOf(b)) || (b.localName === "use" && CLOSE_HINT.test(b.getAttribute("href") || ""))) ||
+          cornerX(box);
         if (pick) {
           done.push(labelOf(pick));
           TT.player.press(pick);
