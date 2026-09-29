@@ -4,7 +4,9 @@ const PRESETS = {
   deepseek: { baseUrl: "https://api.deepseek.com", model: "deepseek-chat" },
   openai: { baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
 };
-const DEFAULTS = { enabled: false, baseUrl: PRESETS.deepseek.baseUrl, model: PRESETS.deepseek.model, apiKey: "", every: 8, stuckAfter: 10, screenshot: false };
+// A private build can carry a key (ai-builtin.js): then the check starts on.
+const BUILTIN = String(self.AI_BUILTIN_KEY || "").trim();
+const DEFAULTS = { enabled: !!BUILTIN, baseUrl: PRESETS.deepseek.baseUrl, model: PRESETS.deepseek.model, apiKey: BUILTIN, every: 8, stuckAfter: 10, screenshot: false };
 
 const $ = (id) => document.getElementById(id);
 const out = $("out");
@@ -35,7 +37,7 @@ function fill(c) {
   $("enabled").checked = c.enabled;
   $("baseUrl").value = c.baseUrl;
   $("model").value = c.model;
-  $("apiKey").value = c.apiKey;
+  $("apiKey").value = c.apiKey || BUILTIN;
   $("every").value = c.every;
   $("stuckAfter").value = c.stuckAfter;
   $("screenshot").checked = c.screenshot;

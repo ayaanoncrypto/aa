@@ -34,7 +34,7 @@ const NET_ERROR = /^net::ERR_(INTERNET_DISCONNECTED|NETWORK_CHANGED|NETWORK_IO_S
 
 const COLORS = { rec: "#2E7A22", ink: "#23241E" };
 
-importScripts("ai.js"); // the AI check (AI settings on the options page)
+importScripts("ai-builtin.js", "ai.js"); // the AI check (AI settings on the options page)
 
 // ---------- state ----------
 

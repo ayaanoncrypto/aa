@@ -8,11 +8,12 @@
 // typed in them) and the step TinyTab waits to do. A screenshot only when
 // "Send a screenshot" is on.
 
+const AI_BUILTIN = String(self.AI_BUILTIN_KEY || "").trim(); // ai-builtin.js
 const AI_DEFAULTS = {
-  enabled: false,
+  enabled: !!AI_BUILTIN,
   baseUrl: "https://api.deepseek.com",
   model: "deepseek-chat",
-  apiKey: "",
+  apiKey: AI_BUILTIN,
   every: 8, // seconds between checks while a step waits (5 to 10)
   stuckAfter: 10, // seconds on one step before the first check
   screenshot: false, // for models that read images
@@ -33,7 +34,7 @@ function cleanAiConfig(raw) {
   c.enabled = !!c.enabled;
   c.baseUrl = String(c.baseUrl || "").trim().replace(/\/+$/, "");
   c.model = String(c.model || "").trim();
-  c.apiKey = String(c.apiKey || "").trim();
+  c.apiKey = String(c.apiKey || "").trim() || AI_BUILTIN;
   c.every = Math.max(5, Math.min(10, Math.round(Number(c.every)) || AI_DEFAULTS.every));
   c.stuckAfter = Math.max(5, Math.min(120, Math.round(Number(c.stuckAfter)) || AI_DEFAULTS.stuckAfter));
   c.screenshot = !!c.screenshot;
