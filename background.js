@@ -57,7 +57,7 @@ let lastTape = null;
 // recoveries, restarts, warnings and TinyTab's own errors. Kept in local
 // storage so "Save log" in the panel can write it to a file, even after Chrome
 // stopped and restarted this worker.
-const LOG_MAX = 400;
+const LOG_MAX = 1000; // a long loop logs a line a run
 let logLines = [];
 let logTimer = 0;
 // The saved log is read when first needed, not each time the worker wakes.
@@ -88,18 +88,34 @@ const ready = (async () => {
   defaults = { ...DEFAULTS, ...(local.defaults || {}) };
   lastTape = local.lastTape || null;
   const open = new Set((await chrome.tabs.query({})).map((t) => t.id));
+  const used = new Set();
   for (const [key, value] of Object.entries(session)) {
     if (!key.startsWith("t:")) continue;
     const id = Number(key.slice(2));
     if (open.has(id)) {
       value.settings = { ...DEFAULTS, ...value.settings }; // settings added since it was saved
-      if (value.tape && value.tape.isLast) value.tape = lastTape ? structuredClone(lastTape) : emptyTape(); // see persist
+      // The tab's tape, saved once under its own key (see persist).
+      const ref = value.tape && value.tape.ref;
+      if (ref) {
+        used.add(ref);
+        value.tape = session[ref] ? structuredClone(session[ref]) : emptyTape();
+      } else if (value.tape && value.tape.isLast) value.tape = lastTape ? structuredClone(lastTape) : emptyTape(); // 2.3.1 to 2.3.6
       tabs.set(id, value);
     } else chrome.storage.session.remove(key);
   }
-  // Resume playback that was running when the worker was stopped.
+  for (const key of Object.keys(session)) {
+    if (!key.startsWith("tape:")) continue;
+    if (used.has(key)) savedTapes.add(key);
+    else chrome.storage.session.remove(key).catch(() => {});
+  }
+  // Playback that was running when Chrome stopped the worker: play again from
+  // step 1, same run. Mid-run, the copied text and the pages' state are gone.
   for (const [id, t] of tabs) {
-    if (t.mode === "playing" && t.link == null) startPlayback(id, true);
+    if (t.mode === "playing" && t.link == null) {
+      log(`TinyTab's worker was restarted by Chrome during run ${t.play.run} (at step ${t.play.index + 1}). Playing again from step 1.`);
+      t.play.index = 0;
+      startPlayback(id, false, { group: t.group });
+    }
     applyBadge(id);
   }
 })();
@@ -165,10 +181,12 @@ function releaseMember(id) {
   notify(id);
 }
 
-// Whether tape is the last tape recorded or opened (lastTape), unchanged.
-function isLastTape(tape) {
-  return !!(lastTape && tape && tape.createdAt === lastTape.createdAt && tape.name === lastTape.name && tape.steps.length === lastTape.steps.length);
-}
+// Tapes are saved in session storage once each, under a key of their own;
+// a tab saves the key. Every copy is read each time the worker wakes (slow),
+// and a note meaning "the last tape" gave a tab the wrong tape back once
+// another file was opened.
+const savedTapes = new Set();
+const tapeKey = (tape) => `tape:${tape.createdAt}:${tape.steps.length}`;
 
 function getTab(tabId) {
   let t = tabs.get(tabId);
@@ -185,9 +203,19 @@ function persist(tabId, now = false) {
   const write = () => {
     saveTimers.delete(tabId);
     const t = tabs.get(tabId);
-    // A tab holding the last tape (most do) saves a note, not a copy: every
-    // copy is read again each time the worker wakes, which slowed the toolbar.
-    if (t) chrome.storage.session.set({ ["t:" + tabId]: isLastTape(t.tape) ? { ...t, tape: { isLast: true } } : t }).catch(() => {});
+    if (!t) return;
+    // A recording in progress changes each step: saved whole, with the tab.
+    if (t.mode === "recording" || !t.tape.steps.length) {
+      chrome.storage.session.set({ ["t:" + tabId]: t }).catch(() => {});
+      return;
+    }
+    const key = tapeKey(t.tape);
+    const data = { ["t:" + tabId]: { ...t, tape: { ref: key } } };
+    if (!savedTapes.has(key)) {
+      data[key] = t.tape;
+      savedTapes.add(key);
+    }
+    chrome.storage.session.set(data).catch(() => savedTapes.delete(key));
   };
   if (now) write();
   else saveTimers.set(tabId, setTimeout(write, 1000));
@@ -2079,6 +2107,7 @@ async function startPlayback(tabId, resumed, again = null) {
 
     while (!ctl.cancelled && t.play.run <= runs()) {
       if (t.play.index === 0) {
+        ctl.runAt = Date.now();
         ctl.clip = null; // each run copies afresh
         const resetting = recoverOn() && t.settings.resetSession !== false;
         // Played again after trouble: log out first if the last run didn't get to.
@@ -2275,6 +2304,7 @@ async function startPlayback(tabId, resumed, again = null) {
         continue;
       }
       t.restarts = 0; // a whole run went through
+      log(`Run ${t.play.run} done${ctl.runAt ? ` in ${Math.round((Date.now() - ctl.runAt) / 1000)} s` : ""}`);
       ctl.tries.clear();
       ctl.aiReloads.clear();
       ctl.aiGoal.clear();
