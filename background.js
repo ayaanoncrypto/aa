@@ -1454,9 +1454,8 @@ async function clickWatch(lead, ctl, t) {
       const r = await sendWithTimeout(cur.id, { type: "unblock" }, 8000).catch(() => null);
       if (r && Array.isArray(r.done) && r.done.length) {
         log(`  Step ${i + 1}: closed a popup in the way (${r.done.join(", ")})`);
-        ctl.aiAgain.delete(i); // the click it covered may be pressed again
-        cur.at = Date.now() - AGAIN_AFTER_MS + 800; // soon
-        continue;
+        ctl.aiAgain.delete(i); // the click it covered is pressed again, now (below)
+        cur.at = Date.now() - AGAIN_AFTER_MS;
       }
     }
     // Sent to the home page while this step waits: go to the goal page, carry on.
@@ -2378,14 +2377,6 @@ async function startPlayback(tabId, resumed, again = null) {
           await onKick(i, target);
           break;
         }
-        if (recoverOn() && !ctl.aiGoal.get(i) && aiConfig.goalLink && (await onHomePage(t, i, target))) {
-          // Sent to the home page (after the sign-up, say): go to the goal page
-          // and carry on from the step that fits there (Register, then log out).
-          const tab = await chrome.tabs.get(target).catch(() => null);
-          ctl.kick = { action: "goal", why: `the tab is on the home page (${tab ? pageOf(tab.url) : "?"})` };
-          await onKick(i, target);
-          break;
-        }
         await ensureReferral(ctl, target);
         ctl.kick = null; // a verdict on an earlier step
         // since: the first try at this step in this run (click-agains don't
@@ -2456,6 +2447,13 @@ async function startPlayback(tabId, resumed, again = null) {
         if (!step.page && step.target && PLACE_TYPES.has(step.type) && res && res.ok && pageOf(res.page || "")) {
           step.page = pageOf(res.page);
           t.tapeDirty = true; // saved when a whole run goes through
+        }
+        // The goal button (Register Now) often opens a popup that covers the
+        // next click (the profile icon): close it before going on.
+        if (res && res.ok && i === goalStep(steps) && recoverOn()) {
+          await sleep(400, ctl);
+          const r = await sendWithTimeout(target, { type: "unblock" }, 8000).catch(() => null);
+          if (r && Array.isArray(r.done) && r.done.length) log(`  Step ${i + 1}: closed the popup it opened (${r.done.join(", ")})`);
         }
         // The code rule: from Send pressed until the code is typed or pasted in its tab.
         if (isSendStep(step)) {
