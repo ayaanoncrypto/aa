@@ -1181,8 +1181,9 @@ function stepText(st) {
 }
 
 // What the tab shows, in words (content/sense.js). null when the page doesn't answer.
-async function tabSnapshot(id) {
-  const r = await sendWithTimeout(id, { type: "snapshot" }, 5000).catch(() => null);
+// watch: ms to look for the page changing (a page loading or updating).
+async function tabSnapshot(id, watch = 1000) {
+  const r = await sendWithTimeout(id, { type: "snapshot", watch }, 5000).catch(() => null);
   return r && r.ok && r.snap ? r.snap : null;
 }
 
@@ -1296,12 +1297,11 @@ async function aiWatch(lead, ctl, t) {
 
 // At the start of a run, when the tab's first step is on the page: whether
 // the AI sees the tab still signed in from an earlier run all the same.
-async function aiSignedInAtStart(lead, ctl, t, s, k, id) {
+async function aiSignedInAtStart(ctl, t, s, k, id) {
   if (!aiUsable()) return false;
   try {
-    const snap = await tabSnapshot(id);
+    const snap = await tabSnapshot(id, 0); // at once: the run is already going
     if (!snap || ctl.cancelled) return false;
-    say(lead, "Asking the AI whether the tab is at the start");
     const question = "The run is about to start. Is this tab at the start of the recording, or still signed in from an earlier run?";
     const a = await aiAsk(snap, aiJob(t, k, snap, question), await aiShot(id, awakeTabs.has(id)));
     log(`  AI at the start of tab ${s + 1}: ${aiSummary(a)}`);
@@ -1309,9 +1309,19 @@ async function aiSignedInAtStart(lead, ctl, t, s, k, id) {
   } catch (e) {
     log(`  AI check failed: ${(e && e.message) || e}`);
     return false;
-  } finally {
-    say(lead, "");
   }
+}
+
+// The start check runs beside the run, so Play starts at once. When the AI
+// sees the tab still signed in, the run stops at the step it is on, logs out
+// in that tab and starts again (onKick in startPlayback).
+async function aiStartCheck(ctl, t, s, k, id) {
+  const run = t.play.run;
+  if (!(await aiSignedInAtStart(ctl, t, s, k, id))) return;
+  if (ctl.cancelled || ctl.over || t.play.run !== run) return;
+  const verdict = { action: "logout", why: `the AI sees tab ${s + 1} still signed in, not at the start of the recording`, id, slot: s };
+  if (ctl.cur) kick(ctl, verdict);
+  else ctl.startKick = verdict; // taken up before the next step
 }
 
 // ---------- the start of each run ----------
@@ -1355,18 +1365,18 @@ async function ensureStartState(lead, ctl, t, group, slots, steps) {
     if (k < 0) continue;
     const id = group[s];
     if (await here(id, k, START_WAIT_MS)) {
-      // The first step's element can show on a signed-in home page too.
-      if (!(await aiSignedInAtStart(lead, ctl, t, s, k, id))) continue;
-      sendGroup(lead, { type: "warn", text: `Tab ${s + 1}: the AI sees it still signed in, not at the start of the recording. Logging out.` });
-    } else {
-      const what = steps[k].target.text ? `"${steps[k].target.text.slice(0, 40)}"` : "its first button or field";
-      sendGroup(lead, { type: "warn", text: `Tab ${s + 1} doesn't look like the start of the recording (${what} isn't there). Resetting it.` });
-      // A popup in the way?
-      const r0 = await sendWithTimeout(id, { type: "unblock" }, 15000).catch(() => null);
-      if (r0 && r0.done && r0.done.length) {
-        log(`  Closed a popup: ${r0.done.join(", ")}`);
-        if (await here(id, k, 3000)) continue;
-      }
+      // The first step's element can show on a signed-in home page too: the
+      // AI looks, while the run goes on.
+      if (aiUsable()) aiStartCheck(ctl, t, s, k, id).catch(() => {});
+      continue;
+    }
+    const what = steps[k].target.text ? `"${steps[k].target.text.slice(0, 40)}"` : "its first button or field";
+    sendGroup(lead, { type: "warn", text: `Tab ${s + 1} doesn't look like the start of the recording (${what} isn't there). Resetting it.` });
+    // A popup in the way?
+    const r0 = await sendWithTimeout(id, { type: "unblock" }, 15000).catch(() => null);
+    if (r0 && r0.done && r0.done.length) {
+      log(`  Closed a popup: ${r0.done.join(", ")}`);
+      if (await here(id, k, 3000)) continue;
     }
     // 1. Log out, the tape's way first, then any way the page offers.
     say(lead, "Logging out before starting");
@@ -1489,6 +1499,7 @@ async function startPlayback(tabId, resumed, again = null) {
     cur: null, // { i, id, since }
     kick: null, // { action, why }
     kickers: new Set(),
+    startKick: null, // the start check's verdict, for the next step
     aiReloads: new Map(), // step index -> reloads the AI check asked for in this run
     over: false, // playback ended
   };
@@ -1652,6 +1663,8 @@ async function startPlayback(tabId, resumed, again = null) {
       const k = ctl.kick;
       ctl.kick = null;
       send(id, { type: "abort" }).catch(() => {}); // the page stops waiting for the step
+      const slot = k.slot != null ? k.slot : steps[i].tab || 0;
+      if (k.id != null) id = k.id; // the start check names its tab
       trouble = `Step ${i + 1}: ${k.why}`;
       const next = { logout: "Logging out, then starting again.", restart: "Starting again from step 1.", refresh: "Reloading the page." }[k.action];
       sendGroup(tabId, { type: "warn", text: `${trouble}. ${next}` });
@@ -1659,7 +1672,7 @@ async function startPlayback(tabId, resumed, again = null) {
       if (k.action === "logout") {
         say(tabId, "Logging out");
         // The tape's own log out first, then any the page offers.
-        if (!(await signOutFirst(tabId, ctl, t, group, steps, steps[i].tab || 0)) && !ctl.cancelled) {
+        if (!(await signOutFirst(tabId, ctl, t, group, steps, slot)) && !ctl.cancelled) {
           const r = await sendWithTimeout(id, { type: "signout" }, 20000).catch(() => null);
           if (r && r.done) {
             log(`  Pressed "${r.label}"${r.opened ? ` (in the "${r.opened}" menu)` : ""}`);
@@ -1769,6 +1782,12 @@ async function startPlayback(tabId, resumed, again = null) {
           clip: ctl.clip,
           settings: t.settings,
         };
+        if (ctl.startKick) {
+          ctl.kick = ctl.startKick;
+          ctl.startKick = null;
+          await onKick(i, target);
+          break;
+        }
         ctl.kick = null; // a verdict on an earlier step
         ctl.cur = { i, id: target, since: Date.now() };
         let res = await performStep(target, ctl, msg);

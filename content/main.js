@@ -19,20 +19,14 @@
     if (!s.on) {
       TT.recorder.stop();
       TT.player.end();
-      TT.sense.unwatch();
       TT.deck.hide();
       return;
     }
     TT.deck.show(s);
     if (s.mode === "recording") TT.recorder.start(s.settings);
     else TT.recorder.stop();
-    if (s.mode === "playing") {
-      TT.player.begin(s.settings);
-      TT.sense.watch();
-    } else {
-      TT.player.end();
-      TT.sense.unwatch();
-    }
+    if (s.mode === "playing") TT.player.begin(s.settings);
+    else TT.player.end();
   }
 
   function teardown() {
@@ -40,7 +34,6 @@
     dead = true;
     TT.recorder.stop();
     TT.player.teardown();
-    TT.sense.unwatch();
     TT.deck.hide();
     try {
       chrome.runtime.onMessage.removeListener(onMessage);
@@ -98,12 +91,8 @@
         TT.sense.unblock().then((done) => reply({ ok: true, done }), () => reply({ ok: true, done: [] }));
         return true;
       case "snapshot":
-        try {
-          reply({ ok: true, snap: TT.sense.snapshot() });
-        } catch (e) {
-          reply({ ok: false, error: String(e) });
-        }
-        return;
+        TT.sense.snapshot(msg.watch).then((snap) => reply({ ok: true, snap }), (e) => reply({ ok: false, error: String(e) }));
+        return true;
       case "abort":
         TT.player.abort();
         reply({ ok: true });

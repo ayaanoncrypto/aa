@@ -178,27 +178,23 @@
 
   // ---------- what the page shows (for the AI check) ----------
 
-  // When the page last changed. A page that stopped changing while TinyTab
-  // waits is frozen or done; one still changing is loading or animating.
-  let changedAt = 0;
-  let watcher = null;
+  // Whether the page changes within ms (a page loading or updating does).
+  // Watched only while TinyTab asks, so playback pays nothing for it.
   const ours = (n) => n.nodeType === 1 && TT.HOST_TAGS.has(n.localName);
-  function watch() {
-    if (watcher) return;
-    changedAt = Date.now();
-    watcher = new MutationObserver((list) => {
-      for (const m of list) {
-        if (ours(m.target)) continue;
-        if (m.type === "childList" && [...m.addedNodes, ...m.removedNodes].every(ours)) continue;
-        changedAt = Date.now();
-        return;
-      }
+  const theirs = (m) => !ours(m.target) && !(m.type === "childList" && [...m.addedNodes, ...m.removedNodes].every(ours));
+  function changesWithin(ms) {
+    return new Promise((resolve) => {
+      const done = (v) => {
+        clearTimeout(timer);
+        mo.disconnect();
+        resolve(v);
+      };
+      const mo = new MutationObserver((list) => {
+        if (list.some(theirs)) done(true);
+      });
+      mo.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
+      const timer = setTimeout(() => done(false), ms);
     });
-    watcher.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
-  }
-  function unwatch() {
-    if (watcher) watcher.disconnect();
-    watcher = null;
   }
 
   const LOADERS = '[aria-busy="true"], [role="progressbar"], progress, [class*="spinner" i], [class*="loading" i], [class*="loader" i], [class*="skeleton" i]';
@@ -207,10 +203,12 @@
     return r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth;
   };
   // Up to max distinct names of the elements on screen that match sel.
+  // Looks at 400 elements at most: a big page has thousands.
   function onScreen(sel, name, max) {
     const out = [];
+    let seen = 0;
     for (const el of document.querySelectorAll(sel)) {
-      if (out.length >= max) break;
+      if (out.length >= max || ++seen > 400) break;
       if (!TT.isVisible(el) || !inViewport(el)) continue;
       const v = name(el);
       if (v && !out.includes(v)) out.push(v);
@@ -226,25 +224,32 @@
 
   // The page in words: address without the query, title, the start of its
   // text, and the names of what is on screen. Never what is typed in a field.
-  function snapshot() {
+  // watch: how long to look for changes, in ms (0: don't).
+  async function snapshot(watch = 1000) {
+    const changing = watch > 0 ? changesWithin(watch) : Promise.resolve(null);
     let loaders = 0;
     for (const el of document.querySelectorAll(LOADERS)) {
       if (TT.isVisible(el) && inViewport(el) && ++loaders >= 20) break;
     }
-    return {
+    const controls = onScreen('button, a, [role="button"], [role="tab"], [role="menuitem"], input[type="submit"], input[type="button"]', controlName, 40);
+    // A log out control on screen, or a log out link anywhere (a cheap look,
+    // unlike signOutControls, which reads every box on the page).
+    const signOut = controls.some((c) => SIGN_OUT.test(c)) || Array.from(document.querySelectorAll("a[href]")).some((a) => SIGN_OUT_HREF.test(a.getAttribute("href")));
+    const snap = {
       url: location.origin + location.pathname,
       title: clean(document.title).slice(0, 150),
       readyState: document.readyState,
-      quietSec: watcher ? Math.round((Date.now() - changedAt) / 1000) : null,
       loaders,
       headings: onScreen("h1, h2, h3", (el) => clean(el.innerText).slice(0, 80), 8),
       text: clean(document.body ? document.body.innerText : "").slice(0, 1500),
-      controls: onScreen('button, a, [role="button"], [role="tab"], [role="menuitem"], input[type="submit"], input[type="button"]', controlName, 40),
+      controls,
       fields: onScreen('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select', fieldName, 15),
       dialogs: onScreen('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open]', (el) => clean(el.innerText).slice(0, 200), 3),
-      signOut: signOutControls().length > 0,
+      signOut,
     };
+    snap.changing = await changing; // still loading or updating while watched
+    return snap;
   }
 
-  TT.sense = { signOut, unblock, signOutControls, menuOpeners, SIGN_OUT, snapshot, watch, unwatch };
+  TT.sense = { signOut, unblock, signOutControls, menuOpeners, SIGN_OUT, snapshot };
 })();

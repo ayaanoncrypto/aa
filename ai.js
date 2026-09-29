@@ -214,7 +214,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     url: "https://example.com/dashboard",
     title: "Dashboard",
     readyState: "complete",
-    quietSec: 12,
+    changing: false,
     loaders: 0,
     headings: ["Welcome back, Sam"],
     text: "Welcome back, Sam. Total balance 120.00 USDT. Deposit Withdraw Anniversary rewards Log out",
