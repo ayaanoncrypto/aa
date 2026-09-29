@@ -1371,7 +1371,8 @@ async function clickWatch(lead, ctl, t) {
 
 // Same words as REFERRAL in content/sense.js.
 const REFERRAL = /(refer|invit|promo(tion)?[\s_-]*code|推荐|邀请|招待|紹介|초대|추천|parrain|empfehl|referido|indica)/i;
-const referralTarget = (tg) => !!tg && REFERRAL.test([tg.text, ...["placeholder", "aria-label", "name", "id"].map((k) => (tg.attrs || {})[k])].join(" "));
+const referralTarget = (tg) =>
+  !!tg && REFERRAL.test([tg.text, ...["placeholder", "aria-label", "name", "id"].map((k) => (tg.attrs || {})[k])].join(" ")) && !/prefer|e-?mail|password|verif/i.test([tg.text, ...["placeholder", "aria-label", "name", "id"].map((k) => (tg.attrs || {})[k])].join(" "));
 // A click on an icon or an empty box (the arrow that opens the section).
 const blankClick = (st) => st.type === "click" && st.target && !String(st.target.text || "").trim() && !["input", "textarea", "select"].includes(st.target.tag);
 
@@ -1381,7 +1382,11 @@ const blankClick = (st) => st.type === "click" && st.target && !String(st.target
 // field's own name may be only "Enter code".
 function referralSteps(steps) {
   const out = new Set();
-  const onField = (st) => ["click", "input", "paste", "key"].includes(st.type) && st.target && ["input", "textarea"].includes(st.target.tag);
+  // Not a referral field: email, phone, password, a verification code (same
+  // words as NOT_REFERRAL in content/sense.js). Never skipped.
+  const NOT_REFERRAL = /(e-?mail|mail|phone|mobile|password|passwd|user ?name|account|verif|otp|captcha|prefer|邮箱|手机|密码|验证码|用户名)/i;
+  const otherField = (tg) => ["email", "password"].includes((tg.attrs || {}).type) || NOT_REFERRAL.test(["placeholder", "aria-label", "name", "id", "title"].map((k) => (tg.attrs || {})[k]).join(" "));
+  const onField = (st) => ["click", "input", "paste", "key"].includes(st.type) && st.target && ["input", "textarea"].includes(st.target.tag) && !otherField(st.target);
   steps.forEach((st, k) => {
     if (!["click", "input", "paste", "key"].includes(st.type) || !referralTarget(st.target)) return;
     out.add(k);

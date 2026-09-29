@@ -498,8 +498,20 @@
     return full.trim();
   }
 
+  // A box that holds text before a paste: select it, so the paste replaces
+  // it. The box was empty when recorded; left-over text (a code put in the
+  // wrong box) would end up in front of the pasted text.
+  function selectForPaste(el) {
+    if ((el.localName === "input" || el.localName === "textarea") && el.value) {
+      try {
+        el.select();
+      } catch (_) {}
+    }
+  }
+
   function pasteInto(el, text) {
     if (document.activeElement !== el && typeof el.focus === "function") el.focus({ preventScroll: true });
+    selectForPaste(el);
     // Sites that read the clipboard on paste get this text (see clipboard-main.js).
     document.dispatchEvent(new CustomEvent("tinytab:clip", { detail: text }));
     let data = null;
@@ -769,6 +781,7 @@
         if (msg.native) {
           // The worker pastes for real (trusted Ctrl+V). Just put focus in place.
           if (document.activeElement !== el && typeof el.focus === "function") el.focus({ preventScroll: true });
+          selectForPaste(el);
           document.dispatchEvent(new CustomEvent("tinytab:clip", { detail: text }));
           return done({ nativeReady: document.activeElement === el || el.contains(document.activeElement) });
         }

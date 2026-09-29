@@ -292,15 +292,20 @@
   // Referral / invite code fields, in the languages sign-up forms use most.
   // Same words as REFERRAL in background.js.
   const REFERRAL = /(refer|invit|promo(tion)?[\s_-]*code|推荐|邀请|招待|紹介|초대|추천|parrain|empfehl|referido|indica)/i;
-  const nearText = (el) => {
-    for (let n = el.parentElement, d = 0; n && d < 2; n = n.parentElement, d++) {
-      if (n.textContent && n.textContent.length <= 80) return n.textContent;
-    }
-    return "";
-  };
-  const fieldWords = (el) => [el.getAttribute("placeholder"), el.getAttribute("aria-label"), el.name, el.id, el.labels && el.labels[0] ? el.labels[0].textContent : "", nearText(el)].join(" ");
+  // Never a referral field: email, phone, password, user name, a verification code.
+  const NOT_REFERRAL = /(e-?mail|mail|phone|mobile|password|passwd|user ?name|account|verif|otp|captcha|prefer|邮箱|手机|密码|验证码|用户名)/i;
+  // A field's own name: placeholder, aria-label, name, id, title, its label.
+  // Never the text around it: an email box sits in the same box as the
+  // "Invite Code" line, and took the code once.
+  const ownWords = (el) => [el.getAttribute("placeholder"), el.getAttribute("aria-label"), el.name, el.id, el.getAttribute("title"), el.labels && el.labels[0] ? el.labels[0].textContent : ""].join(" ");
+  function isReferralField(el) {
+    if (TT.HOST_TAGS.has(el.localName) || el.type === "email" || el.type === "password") return false;
+    const own = ownWords(el);
+    return !NOT_REFERRAL.test(own) && REFERRAL.test(own);
+  }
+  const TEXT_FIELDS = 'input:not([type]), input[type="text"], input[type="search"], input[type="tel"], input[type="number"]';
   function referralFields(root = document) {
-    return Array.from(root.querySelectorAll('input:not([type]), input[type="text"], input[type="search"], input[type="tel"], input[type="number"]')).filter((el) => !TT.HOST_TAGS.has(el.localName) && REFERRAL.test(fieldWords(el)));
+    return Array.from(root.querySelectorAll(TEXT_FIELDS)).filter(isReferralField);
   }
   // The line that opens a closed referral field: "Invite Code (Optional) ⌄",
   // "Referral ID", "邀请码". It names a code or an ID, which a "Referral
@@ -345,10 +350,17 @@
         if (pressedOpeners.has(opener)) continue;
         pressedOpeners.add(opener);
         opened = clean(opener.textContent).slice(0, 60);
+        const shown = new Set(Array.from(document.querySelectorAll(TEXT_FIELDS)).filter(TT.isVisible));
         TT.player.press(opener);
         for (let k = 0; k < 8 && !el; k++) {
           await sleep(100);
           el = referralFields().find(TT.isVisible);
+          if (!el) {
+            // The one field that just showed up is the referral field, whatever its name,
+            // unless it is plainly something else.
+            const fresh = Array.from(document.querySelectorAll(TEXT_FIELDS)).filter((f) => !shown.has(f) && TT.isVisible(f) && !NOT_REFERRAL.test(ownWords(f)));
+            if (fresh.length === 1) el = fresh[0];
+          }
         }
         if (el) break;
       }
