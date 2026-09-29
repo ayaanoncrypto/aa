@@ -136,6 +136,20 @@ const ready = (async () => {
 // way, or a "Playing again in ..." wait that got lost (Chrome stopped the
 // worker during it), starts again: now, and checked every minute (alarm).
 function autoRestart(why) {
+  // A playback that made no progress for NO_PROGRESS_MS is stuck in a way
+  // nothing else caught: stop it; it plays again below. One marked playing
+  // with no player (its loop died) too.
+  for (const [id, t] of tabs) {
+    if (t.mode !== "playing" || t.link != null) continue;
+    const ctl = players.get(id);
+    if (ctl && Date.now() - (ctl.progressAt || 0) < NO_PROGRESS_MS) continue;
+    log(ctl ? `No progress for ${NO_PROGRESS_MS / 60000} minutes (run ${t.play.run}, step ${t.play.index + 1}): stopping and playing again` : "Playback had no player left: playing again");
+    t.lastRun = t.play.run;
+    const auto = t.auto;
+    stopPlayback(id, false);
+    t.auto = auto;
+    t.mode = "idle";
+  }
   for (const [id, t] of tabs) {
     if (!t.auto || !t.on || t.mode !== "idle" || t.link != null || replays.has(id) || players.has(id)) continue;
     if (!t.tape.steps.length && lastTape) t.tape = structuredClone(lastTape); // load the tape again
@@ -145,6 +159,7 @@ function autoRestart(why) {
     startPlayback(id, false, t.group ? { group: t.group } : { group: [id] });
   }
 }
+const NO_PROGRESS_MS = 3 * 60000;
 chrome.alarms.create("tinytab-keep-playing", { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener(async (a) => {
   if (a.name !== "tinytab-keep-playing") return;
@@ -1981,10 +1996,10 @@ async function togglePlay(tabId) {
   startPlayback(tabId, false);
 }
 
-function stopPlayback(tabId) {
+function stopPlayback(tabId, byUser = true) {
   tabId = leaderOf(tabId);
   cancelReplay(tabId);
-  if (players.has(tabId)) log("Stopped (Stop pressed, tab closed or TinyTab turned off)");
+  if (players.has(tabId) && byUser) log("Stopped (Stop pressed, tab closed or TinyTab turned off)");
   const members = groupOf(tabId).filter((id) => id !== tabId);
   const ctl = players.get(tabId);
   if (ctl) {
@@ -2064,6 +2079,7 @@ async function startPlayback(tabId, resumed, again = null) {
     aiReloads: new Map(), // step index -> reloads the AI check asked for in this run
     over: false, // playback ended
   };
+  ctl.progressAt = Date.now(); // see autoRestart
   players.set(tabId, ctl);
 
   const t = getTab(tabId);
@@ -2294,7 +2310,7 @@ async function startPlayback(tabId, resumed, again = null) {
 
     while (!ctl.cancelled && t.play.run <= runs()) {
       if (t.play.index === 0) {
-        ctl.runAt = Date.now();
+        ctl.runAt = ctl.progressAt = Date.now();
         ctl.clip = null; // each run copies afresh
         const resetting = recoverOn() && t.settings.resetSession !== false;
         // Played again after trouble: log out first if the last run didn't get to.
@@ -2330,6 +2346,7 @@ async function startPlayback(tabId, resumed, again = null) {
           await ensureReferral(ctl, target);
           log(`  Step ${i + 1} skipped: the referral code is filled in by TinyTab`);
           t.play.index = i + 1;
+          ctl.progressAt = Date.now();
           sendGroup(tabId, { type: "done", index: i, run: t.play.run });
           continue;
         }
@@ -2338,6 +2355,7 @@ async function startPlayback(tabId, resumed, again = null) {
           // before 1.1.1 can hold a paste again as typing, which would type the
           // old code over the fresh paste. Skip both.
           t.play.index = i + 1;
+          ctl.progressAt = Date.now();
           sendGroup(tabId, { type: "done", index: i, run: t.play.run });
           continue;
         }
@@ -2373,6 +2391,7 @@ async function startPlayback(tabId, resumed, again = null) {
           if (!t.settings.skipMissing) throw new Error(what);
           sendGroup(tabId, { type: "warn", text: what + " (skipped)" });
           t.play.index = i + 1;
+          ctl.progressAt = Date.now();
           continue;
         }
         const seq0 = ctl.clipSeq;
@@ -2484,6 +2503,7 @@ async function startPlayback(tabId, resumed, again = null) {
           ctl.codeTicking = false;
         }
         t.play.index = i + 1;
+        ctl.progressAt = Date.now();
         persist(tabId);
         sendGroup(tabId, { type: "done", index: i, run: t.play.run });
       }
