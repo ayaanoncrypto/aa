@@ -142,7 +142,7 @@ function autoRestart(why) {
   for (const [id, t] of tabs) {
     if (t.mode !== "playing" || t.link != null) continue;
     const ctl = players.get(id);
-    if (ctl && Date.now() - (ctl.progressAt || 0) < NO_PROGRESS_MS) continue;
+    if (ctl && Date.now() - (t.progressAt || 0) < NO_PROGRESS_MS) continue;
     log(ctl ? `No progress for ${NO_PROGRESS_MS / 60000} minutes (run ${t.play.run}, step ${t.play.index + 1}): stopping and playing again` : "Playback had no player left: playing again");
     t.lastRun = t.play.run;
     const auto = t.auto;
@@ -246,7 +246,7 @@ function getTab(tabId) {
 
 const saveTimers = new Map();
 function persist(tabId, now = false) {
-  clearTimeout(saveTimers.get(tabId));
+  if (now) clearTimeout(saveTimers.get(tabId));
   const write = () => {
     saveTimers.delete(tabId);
     const t = tabs.get(tabId);
@@ -264,8 +264,11 @@ function persist(tabId, now = false) {
     }
     chrome.storage.session.set(data).catch(() => savedTapes.delete(key));
   };
+  // At most once a second, and never put off: a timer reset on each call
+  // never fired while steps came faster than that, and a worker restart
+  // then resumed from a place saved a run earlier.
   if (now) write();
-  else saveTimers.set(tabId, setTimeout(write, 1000));
+  else if (!saveTimers.has(tabId)) saveTimers.set(tabId, setTimeout(write, 1000));
 }
 
 function snapshot(tabId) {
@@ -2079,10 +2082,12 @@ async function startPlayback(tabId, resumed, again = null) {
     aiReloads: new Map(), // step index -> reloads the AI check asked for in this run
     over: false, // playback ended
   };
-  ctl.progressAt = Date.now(); // see autoRestart
   players.set(tabId, ctl);
 
   const t = getTab(tabId);
+  // The watchdog's clock (see autoRestart). A resume after a worker restart
+  // keeps the old one: restarts alone must not look like progress.
+  if (!resumed || !t.progressAt) t.progressAt = Date.now();
   ctl.steps = t.tape.steps;
   if (aiConfig.referralCode) ctl.refSkip = referralSteps(t.tape.steps);
   aiWatch(tabId, ctl, t).catch((e) => log(`AI check stopped: ${(e && e.message) || e}`));
@@ -2128,6 +2133,11 @@ async function startPlayback(tabId, resumed, again = null) {
       if (k >= 0 && k !== t.play.index) {
         log(`  Resumed at step ${k + 1}, where the page is`);
         t.play.index = k;
+      } else if (k < 0) {
+        // Nothing near the saved place is on the page: start the run over.
+        log("  Nothing on the page fits the saved place: playing again from step 1");
+        t.play.index = 0;
+        ctl.again = true;
       }
     }
     const runs = () => (t.settings.loop ? Infinity : Math.max(1, t.settings.repeat | 0));
@@ -2310,7 +2320,7 @@ async function startPlayback(tabId, resumed, again = null) {
 
     while (!ctl.cancelled && t.play.run <= runs()) {
       if (t.play.index === 0) {
-        ctl.runAt = ctl.progressAt = Date.now();
+        ctl.runAt = t.progressAt = Date.now();
         ctl.clip = null; // each run copies afresh
         const resetting = recoverOn() && t.settings.resetSession !== false;
         // Played again after trouble: log out first if the last run didn't get to.
@@ -2346,7 +2356,7 @@ async function startPlayback(tabId, resumed, again = null) {
           await ensureReferral(ctl, target);
           log(`  Step ${i + 1} skipped: the referral code is filled in by TinyTab`);
           t.play.index = i + 1;
-          ctl.progressAt = Date.now();
+          t.progressAt = Date.now();
           sendGroup(tabId, { type: "done", index: i, run: t.play.run });
           continue;
         }
@@ -2355,7 +2365,7 @@ async function startPlayback(tabId, resumed, again = null) {
           // before 1.1.1 can hold a paste again as typing, which would type the
           // old code over the fresh paste. Skip both.
           t.play.index = i + 1;
-          ctl.progressAt = Date.now();
+          t.progressAt = Date.now();
           sendGroup(tabId, { type: "done", index: i, run: t.play.run });
           continue;
         }
@@ -2391,7 +2401,7 @@ async function startPlayback(tabId, resumed, again = null) {
           if (!t.settings.skipMissing) throw new Error(what);
           sendGroup(tabId, { type: "warn", text: what + " (skipped)" });
           t.play.index = i + 1;
-          ctl.progressAt = Date.now();
+          t.progressAt = Date.now();
           continue;
         }
         const seq0 = ctl.clipSeq;
@@ -2503,7 +2513,7 @@ async function startPlayback(tabId, resumed, again = null) {
           ctl.codeTicking = false;
         }
         t.play.index = i + 1;
-        ctl.progressAt = Date.now();
+        t.progressAt = Date.now();
         persist(tabId);
         sendGroup(tabId, { type: "done", index: i, run: t.play.run });
       }
