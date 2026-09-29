@@ -227,24 +227,38 @@
   // A sign-up form's code button: "Send" while the code hasn't gone, then a
   // countdown in seconds ("90s", "Resend (58s)") once it has.
   const SEND_CODE = /^(send|send code|get code|get the code|resend|resend code|send again|get verification code|send verification code|obtain code|获取验证码|发送|发送验证码|重新发送)$/i;
+  // A countdown's text is the number and little else: "74s", "74 s", "Resend
+  // (74s)", "74秒后重发". A banner ("Offer ends in 5s") or a "3s ago" is not one.
   const SECONDS = /(\d{1,3})\s*(?:s|sec|secs|seconds?|秒)(?![a-z])/i;
+  const TIMER_WORDS = /\b(resend|send|again|in|after|later|code|get|retry|wait)\b|重新发送|后重发|重发|后|获取|发送/gi;
+  const onlyTimer = (text, m) => !text.replace(m[0], "").replace(TIMER_WORDS, "").replace(/[\s()\[\]:：,.-]/g, "");
+  const BUTTONISH = 'button, [role="button"], a, input[type="button"]';
   function codeTimer() {
     let send = "";
     let seconds = null;
+    let text = "";
+    let inButton = false;
     for (const el of document.querySelectorAll('button, a, [role="button"], span, div, input[type="button"]')) {
       if (el.children.length > 2 || TT.HOST_TAGS.has(el.localName)) continue;
       const raw = el.localName === "input" ? el.value : el.textContent && el.textContent.length <= 30 ? el.textContent : "";
-      const text = clean(raw);
-      if (!text) continue;
-      const m = SECONDS.exec(text);
-      if (!m && !SEND_CODE.test(text)) continue;
+      const t = clean(raw);
+      if (!t) continue;
+      const m = SECONDS.exec(t) || (el.matches(BUTTONISH) ? /^\(?\s*(\d{1,3})\s*\)?$/.exec(t) : null); // "(74)" on the button itself
+      if (m && !onlyTimer(t, m)) continue;
+      if (!m && !SEND_CODE.test(t)) continue;
       if (!TT.isVisible(el)) continue;
       if (m) {
         const n = Number(m[1]);
-        if (n <= 300 && (seconds == null || n < seconds)) seconds = n;
-      } else if (!send && !TT.isDisabled(el)) send = text;
+        const button = !!el.closest(BUTTONISH);
+        // The code button's own countdown wins over any other timer on the page.
+        if (n <= 300 && (seconds == null || (button && !inButton) || (button === inButton && n > seconds))) {
+          seconds = n;
+          text = t;
+          inButton = button;
+        }
+      } else if (!send && !TT.isDisabled(el)) send = t;
     }
-    return { send, seconds };
+    return { send, seconds, text };
   }
 
   // Clicks the link or button named like name ("8th Anniversary"): whole
@@ -288,27 +302,27 @@
   function referralFields(root = document) {
     return Array.from(root.querySelectorAll('input:not([type]), input[type="text"], input[type="search"], input[type="tel"], input[type="number"]')).filter((el) => !TT.HOST_TAGS.has(el.localName) && REFERRAL.test(fieldWords(el)));
   }
-  // The sign-up form: the box around the email or password field holding 2+ fields.
-  function signUpForm() {
-    const key = document.querySelector('input[type="password"], input[type="email"], input[autocomplete="email"], input[autocomplete="username"]');
-    if (!key) return null;
-    let n = key.parentElement;
-    for (let d = 0; n && d < 8; d++, n = n.parentElement) {
-      if (n.localName === "form" || n.querySelectorAll("input").length >= 2) return n;
-    }
-    return key.form || null;
-  }
-  // The "Referral code (optional)" line that opens the field, inside the form only
-  // (a "Referral program" link in the site's menu goes elsewhere).
-  function referralOpener(form) {
+  // The line that opens a closed referral field: "Invite Code (Optional) ⌄",
+  // "Referral ID", "邀请码". It names a code or an ID, which a "Referral
+  // program" link in the site's menu doesn't; a link to another page never counts.
+  const REF_OPENER = /(invit\w*|refer\w*|promo\w*|推荐|邀请|招待|紹介|초대|추천)[^a-z0-9]{0,3}(code|id\b|码|코드|コード)/i;
+  function referralOpeners() {
     let best = null;
-    for (const el of form.querySelectorAll('button, a, [role="button"], label, span, div, p')) {
+    for (const el of document.querySelectorAll('button, a, [role="button"], label, span, div, p, h4, h5, h6')) {
       const text = el.textContent || "";
-      if (text.length > 60 || !REFERRAL.test(text) || el.querySelector("input") || !TT.isVisible(el)) continue;
+      if (text.length > 60 || TT.HOST_TAGS.has(el.localName) || !REF_OPENER.test(text) || el.querySelector("input, textarea") || !TT.isVisible(el)) continue;
       if (el.localName === "a" && /^(https?:|\/)/i.test(el.getAttribute("href") || "")) continue;
       if (!best || best.contains(el)) best = el; // the innermost
     }
-    return best;
+    if (!best) return [];
+    // The text itself, then the row around it (where the ⌄ arrow and the
+    // click handler often sit), as long as that row holds no field.
+    const out = [best];
+    for (let n = best.parentElement, d = 0; n && d < 2; n = n.parentElement, d++) {
+      if (n.querySelector("input, textarea") || (n.textContent || "").length > 80) break;
+      out.push(n);
+    }
+    return out;
   }
   function fillField(el, value) {
     el.focus();
@@ -318,27 +332,28 @@
     el.dispatchEvent(new Event("change", { bubbles: true }));
     el.blur();
   }
-  // Puts code in the sign-up form's referral field, opening its section when
-  // closed. Leaves a field that already holds a code alone.
+  // Puts code in the page's referral field, opening its section when closed.
+  // Leaves a field that already holds a code alone.
   //   state: "done" (filled in now), "filled" (had one), "none" (no field);
   //   form: whether the page has a sign-up form (worth another look later).
+  const pressedOpeners = new WeakSet(); // pressed once: a second press would close it
   async function referral(code) {
-    const form = signUpForm();
     let el = referralFields().find(TT.isVisible);
-    if (!el && !form) return { state: "none", form: false };
     let opened = "";
-    if (!el && form) {
-      const opener = referralOpener(form);
-      if (opener) {
+    if (!el) {
+      for (const opener of referralOpeners()) {
+        if (pressedOpeners.has(opener)) continue;
+        pressedOpeners.add(opener);
         opened = clean(opener.textContent).slice(0, 60);
         TT.player.press(opener);
-        for (let k = 0; k < 10 && !el; k++) {
+        for (let k = 0; k < 8 && !el; k++) {
           await sleep(100);
           el = referralFields().find(TT.isVisible);
         }
+        if (el) break;
       }
     }
-    if (!el) return { state: "none", form: true, opened };
+    if (!el) return { state: "none", form: !!document.querySelector("input:not([type=hidden])"), opened };
     if (clean(el.value)) return { state: "filled", value: clean(el.value).slice(0, 40) };
     fillField(el, code);
     return { state: "done", opened };

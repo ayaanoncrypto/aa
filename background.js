@@ -1433,9 +1433,13 @@ async function codeWatch(lead, ctl, t) {
     let why = "";
     if (r.seconds != null) {
       ctl.codeTicking = r.seconds >= aiConfig.codeMin;
-      if (!w.seen) log(`  Code timer: ${r.seconds} s`);
+      // Every reading in the log, 10 s apart: shows what TinyTab took for the timer.
+      if (!w.loggedAt || Date.now() - w.loggedAt >= 10000) {
+        log(`  Code timer: ${r.seconds} s ("${r.text}")`);
+        w.loggedAt = Date.now();
+      }
       w.seen = true;
-      if (!ctl.codeTicking) why = `the code timer is at ${r.seconds} s, below ${aiConfig.codeMin} s, and the code hasn't come`;
+      if (!ctl.codeTicking) why = `the code timer is at ${r.seconds} s ("${r.text}"), below ${aiConfig.codeMin} s, and the code hasn't come`;
     } else if (r.send && Date.now() - w.at >= 3000) {
       ctl.codeTicking = false;
       why = w.seen ? `the code timer ran out ("${r.send}" is back)` : `"${r.send}" is still on the page: the code wasn't sent`;
@@ -2151,6 +2155,19 @@ async function startPlayback(tabId, resumed, again = null) {
           const what = `Step ${i + 1}: ${(res && res.error) || "failed"}`;
           const down = !!(res && res.down) || netErrors.has(target);
           const lost = !!(res && res.missing) && !down;
+          if (recoverOn() && !down && ctl.codeSent && ctl.codeTicking) {
+            // The code is on its way (its timer runs at codeMin or more): only
+            // the code rule may start over (codeWatch). A reload would throw
+            // the form and its timer away. Try the step again; a mail tab gets
+            // a reload first, so a new email shows.
+            const sendSlot = steps[ctl.codeSent.s].tab || 0;
+            log(`  ${what}. The code timer is still running: trying the step again`);
+            if ((step.tab || 0) !== sendSlot) await reloadStuck(tabId, target, ctl);
+            else await sleep(500, ctl);
+            trouble = `${what} (waiting for the code)`;
+            goTo = i;
+            break;
+          }
           // Recovery comes first: skipping a missing step blindly skipped a
           // whole e-mail form (steps 5-8), which can't work. Recovery already
           // skips a step that really is optional (a popup that didn't show).
