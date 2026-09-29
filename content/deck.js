@@ -497,7 +497,7 @@
     $('[data-act="ai"]').textContent = s.ai ? "Settings" : "Set up";
     $(".ai-hint").textContent = s.ai
       ? `On, with ${s.ai}. A step stuck over ${s.aiAfter} s: asks it what the page shows, then logs out, reloads or starts again. Needs "Recover on its own".`
-      : "Off. An AI model (DeepSeek) looks at a stuck page and tells TinyTab to log out, reload or start again.";
+      : "Off. An AI model (TypeSafe Jev) looks at a stuck page and tells TinyTab to log out, reload or start again.";
 
     paintProgress();
     if (s.error) message(s.error, "error");

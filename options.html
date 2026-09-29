@@ -47,21 +47,23 @@
     <label class="check"><input type="checkbox" id="enabled"><span>Use the AI check<br><span class="hint">Needs "Recover on its own" on in the TinyTab panel.</span></span></label>
     <label class="f">Provider
       <select id="preset">
+        <option value="jev">TypeSafe Jev</option>
         <option value="deepseek">DeepSeek</option>
+        <option value="gemini">Google Gemini</option>
         <option value="openai">OpenAI</option>
         <option value="custom">Other (OpenAI-style API)</option>
       </select>
     </label>
     <div class="row">
-      <label class="f">API address<input type="text" id="baseUrl" spellcheck="false" placeholder="https://api.deepseek.com"></label>
-      <label class="f">Model<input type="text" id="model" spellcheck="false" placeholder="deepseek-chat"></label>
+      <label class="f">API address<input type="text" id="baseUrl" spellcheck="false" placeholder="https://api.typesafe.ai"></label>
+      <label class="f">Model<input type="text" id="model" spellcheck="false" placeholder="jev-latest"></label>
     </div>
     <label class="f">API key<input type="password" id="apiKey" spellcheck="false" autocomplete="off" placeholder="sk-..."><span class="hint">Kept in this browser's extension storage. Sent only to the API address above.</span></label>
     <div class="row">
       <label class="f">Check every (seconds)<input type="number" id="every" min="5" max="10"><span class="hint">5 to 10, while a step waits.</span></label>
       <label class="f">First check after (seconds)<input type="number" id="stuckAfter" min="5" max="120"><span class="hint">On one step, before the AI is asked.</span></label>
     </div>
-    <label class="check"><input type="checkbox" id="screenshot"><span>Send a screenshot too<br><span class="hint">Only for models that read images (gpt-4o-mini, say). DeepSeek chat reads text only: leave this off.</span></span></label>
+    <label class="check"><input type="checkbox" id="screenshot"><span>Send a screenshot too<br><span class="hint">Only for models that read images (Gemini, gpt-4o-mini). Jev and DeepSeek chat read text only: leave this off.</span></span></label>
     <div class="btns">
       <button type="submit" class="primary">Save</button>
       <button type="button" class="tonal" id="test">Test</button>
@@ -73,11 +75,12 @@
         <li>The tab's address without the query, its title, and the first 1,500 characters of its visible text.</li>
         <li>The names of the buttons, links and fields on screen. Never what is typed in a field.</li>
         <li>The step TinyTab waits to do, as words ("click the Next button").</li>
-        <li>A screenshot, only with "Send a screenshot too" on.</li>
+        <li>A screenshot, only with "Send a screenshot too" on, and never to Jev.</li>
       </ul>
     </details>
   </form>
 </main>
+<script src="ai-providers.js"></script>
 <script src="ai-builtin.js"></script>
 <script src="options.js"></script>
 </body>

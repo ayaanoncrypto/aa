@@ -1,12 +1,10 @@
 // The AI check's settings. Saved as "ai" in chrome.storage.local; the
 // service worker (ai.js, background.js) reads them from there.
-const PRESETS = {
-  deepseek: { baseUrl: "https://api.deepseek.com", model: "deepseek-chat" },
-  openai: { baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
-};
+const PRESETS = self.AI_PROVIDERS; // ai-providers.js
 // A private build can carry a key (ai-builtin.js): then the check starts on.
 const BUILTIN = String(self.AI_BUILTIN_KEY || "").trim();
-const DEFAULTS = { enabled: !!BUILTIN, baseUrl: PRESETS.deepseek.baseUrl, model: PRESETS.deepseek.model, apiKey: BUILTIN, every: 8, stuckAfter: 10, screenshot: false };
+const SERVICE = PRESETS[aiProviderOf(BUILTIN)];
+const DEFAULTS = { enabled: !!BUILTIN, baseUrl: SERVICE.baseUrl, model: SERVICE.model, apiKey: BUILTIN, every: 8, stuckAfter: 10, screenshot: SERVICE.screenshot };
 
 const $ = (id) => document.getElementById(id);
 const out = $("out");
@@ -46,11 +44,20 @@ function fill(c) {
 
 chrome.storage.local.get("ai").then((v) => fill({ ...DEFAULTS, ...(v.ai || {}) }));
 
-$("preset").addEventListener("change", (e) => {
-  const p = PRESETS[e.target.value];
+function usePreset(k) {
+  const p = PRESETS[k];
   if (!p) return;
+  $("preset").value = k;
   $("baseUrl").value = p.baseUrl;
   $("model").value = p.model;
+  $("screenshot").checked = p.screenshot;
+}
+$("preset").addEventListener("change", (e) => usePreset(e.target.value));
+
+// A pasted key shows its service: switch to it, unless set up by hand.
+$("apiKey").addEventListener("change", () => {
+  const k = aiProviderOf($("apiKey").value);
+  if ($("preset").value !== "custom" && $("preset").value !== k) usePreset(k);
 });
 
 $("form").addEventListener("submit", async (e) => {

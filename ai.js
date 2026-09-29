@@ -1,6 +1,8 @@
-// TinyTab AI check: asks a chat model what a playing tab shows.
-// DeepSeek by default; any OpenAI-style chat API works (base URL, model and
-// key, set on the options page). Loaded into the service worker by background.js.
+// TinyTab AI check: asks an AI model what a playing tab shows.
+// TypeSafe's Jev by default: a decision model that answers typed questions
+// (a choice, yes/no probabilities) about the page. Chat models work too:
+// DeepSeek, Google Gemini, OpenAI or any OpenAI-style chat API (ai-providers.js).
+// Settings on the options page. Loaded into the service worker by background.js.
 //
 // What leaves the computer, and only when the check is on and a step is stuck:
 // the tab's address (without the query), its title, the first part of its
@@ -9,14 +11,15 @@
 // "Send a screenshot" is on.
 
 const AI_BUILTIN = String(self.AI_BUILTIN_KEY || "").trim(); // ai-builtin.js
+const AI_BUILTIN_SERVICE = AI_PROVIDERS[aiProviderOf(AI_BUILTIN)];
 const AI_DEFAULTS = {
   enabled: !!AI_BUILTIN,
-  baseUrl: "https://api.deepseek.com",
-  model: "deepseek-chat",
+  baseUrl: AI_BUILTIN_SERVICE.baseUrl,
+  model: AI_BUILTIN_SERVICE.model,
   apiKey: AI_BUILTIN,
   every: 8, // seconds between checks while a step waits (5 to 10)
   stuckAfter: 10, // seconds on one step before the first check
-  screenshot: false, // for models that read images
+  screenshot: AI_BUILTIN_SERVICE.screenshot, // for models that read images
 };
 const AI_PAGES = ["expected", "start", "home", "login", "error", "blank", "loading", "other"];
 const AI_TIMEOUT_MS = 25000;
@@ -79,44 +82,101 @@ function parseAiAnswer(text) {
   };
 }
 
+// A POST to the AI service with the key; a clear error when it doesn't answer.
+async function aiPost(url, cfg, payload) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), AI_TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.apiKey}` },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    throw new Error(e && e.name === "AbortError" ? `no answer in ${AI_TIMEOUT_MS / 1000} s` : String((e && e.message) || e));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const aiFailed = async (r) => new Error(`${r.status} ${(await r.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 200)}`);
+
+// Jev (TypeSafe's System One API): the page kinds as a choice, the rest as
+// yes/no questions. It reads text only, never a screenshot.
+const aiIsJev = (cfg) => /^jev/i.test(cfg.model) || /typesafe\.ai/i.test(cfg.baseUrl);
+const JEV_PAGES = {
+  expected: "The page the waiting step belongs on, loaded normally. Content still arriving there (an email, a list) counts.",
+  start: "The page where the recording began, ready for its first step.",
+  home: "A signed-in home screen, dashboard, wallet or account page that is not the page the step needs.",
+  login: "A sign-in or sign-up form that is not the page the step needs.",
+  error: "An error page: 404, 500, something went wrong, access denied, too many requests, blocked.",
+  blank: "An empty or white page.",
+  loading: "A spinner, skeleton or progress bar covering the page.",
+  other: "Any other page: a promotion, an anniversary or event page, another part of the site.",
+};
+const JEV_QUESTIONS = {
+  page: { type: "choice", instructions: "Which kind of page does the tab show, for the step TinyTab waits to do?", criteria: JEV_PAGES },
+  stuck: { type: "noul", instructions: "Will waiting longer not help, because the page is frozen, blank, stuck loading or shows an error?" },
+  signedIn: { type: "noul", instructions: "Does the page show a signed-in account: an account menu, an avatar, a balance, a log out control?" },
+  atStart: { type: "noul", instructions: "Is the page ready for the recording's first step (task.firstStep)?" },
+};
+// How sure Jev must be before TinyTab logs out or starts over on its word.
+const JEV_YES = 0.6;
+
+async function aiAskJev(snap, job, cfg) {
+  const r = await aiPost(cfg.baseUrl + "/v1/systemone", cfg, {
+    model: cfg.model,
+    state: {
+      about: "TinyTab, a browser extension, replays a recorded task in a browser tab. tab is what the tab shows now; task is the step TinyTab waits to do.",
+      task: job,
+      tab: snap || "the page did not answer",
+    },
+    questions: JEV_QUESTIONS,
+  });
+  if (!r.ok) throw await aiFailed(r);
+  const data = await r.json();
+  const a = (data && data.answers) || {};
+  if (!a.page || typeof a.page.choice !== "string") throw new Error(`Jev answered without a page: ${JSON.stringify(data).slice(0, 160)}`);
+  const p = (q) => (a[q] && typeof a[q].noul === "number" ? a[q].noul : 0);
+  const pct = (n) => `${Math.round(n * 100)}%`;
+  const page = AI_PAGES.includes(a.page.choice) ? a.page.choice : "other";
+  return {
+    page,
+    stuck: p("stuck") >= JEV_YES,
+    signedIn: p("signedIn") >= JEV_YES,
+    atStart: p("atStart") >= 0.5,
+    reason: `Jev: ${page} ${pct(a.page.confidence || 0)}, stuck ${pct(p("stuck"))}, signed in ${pct(p("signedIn"))}, at start ${pct(p("atStart"))}`,
+  };
+}
+
 // Asks the model about one tab. snap: what the page reported (content/sense.js);
-// job: the step TinyTab waits for; shot: a data: URL or null.
+// job: the step TinyTab waits for; shot: a data: URL or null (chat models only).
 async function aiAsk(snap, job, shot, cfg = aiConfig) {
+  if (aiIsJev(cfg)) return aiAskJev(snap, job, cfg);
   const text = JSON.stringify({ task: job, tab: snap || "the page did not answer" });
+  const gemini = /generativelanguage\.googleapis\.com/.test(cfg.baseUrl);
   const content = shot ? [{ type: "text", text }, { type: "image_url", image_url: { url: shot } }] : text;
   const body = {
     model: cfg.model,
     temperature: 0,
-    max_tokens: 300,
+    // Gemini counts its thinking in max_tokens: keep the thinking short, allow more.
+    max_tokens: gemini ? 2048 : 300,
+    ...(gemini ? { reasoning_effort: "low" } : {}),
     response_format: { type: "json_object" },
     messages: [
       { role: "system", content: AI_SYSTEM },
       { role: "user", content },
     ],
   };
-  const post = async (payload) => {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), AI_TIMEOUT_MS);
-    try {
-      return await fetch(cfg.baseUrl + "/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.apiKey}` },
-        body: JSON.stringify(payload),
-        signal: ctrl.signal,
-      });
-    } catch (e) {
-      throw new Error(e && e.name === "AbortError" ? `no answer in ${AI_TIMEOUT_MS / 1000} s` : String((e && e.message) || e));
-    } finally {
-      clearTimeout(timer);
-    }
-  };
+  const post = (payload) => aiPost(cfg.baseUrl + "/chat/completions", cfg, payload);
   let r = await post(body);
   if (r.status === 400) {
     // Some models don't take response_format; the prompt asks for JSON anyway.
     delete body.response_format;
     r = await post(body);
   }
-  if (!r.ok) throw new Error(`${r.status} ${(await r.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 200)}`);
+  if (!r.ok) throw await aiFailed(r);
   const data = await r.json();
   const msg = data && data.choices && data.choices[0] && data.choices[0].message;
   return parseAiAnswer(msg && msg.content);
@@ -126,7 +186,7 @@ async function aiAsk(snap, job, shot, cfg = aiConfig) {
 // connection that keeps playing tabs awake (works for tabs in the back), else
 // only when the tab is the one in front.
 async function aiShot(tabId, viaDebugger) {
-  if (!aiConfig.screenshot) return null;
+  if (!aiConfig.screenshot || aiIsJev(aiConfig)) return null;
   const within = (p, ms) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error("timeout")), ms))]);
   try {
     if (viaDebugger) {
