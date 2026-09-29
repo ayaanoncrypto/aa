@@ -1347,7 +1347,7 @@ async function clickWatch(lead, ctl, t) {
     if (ctl.codeSent && ctl.codeTicking) continue; // the code is on its way
     const i = cur.i;
     const k = lastClickBefore(steps, i);
-    if (k < 0 || isSendStep(steps[k]) || !steps[i].target) continue;
+    if (k < 0 || isSendStep(steps[k]) || ctl.refSkip.has(k) || !steps[i].target) continue;
     const prevId = ctl.group[steps[k].tab || 0];
     if (prevId == null || navPending.get(prevId) || netErrors.has(prevId)) continue;
     // Still on the page of that click (tapes from 2.0.2 on know it).
@@ -1360,6 +1360,64 @@ async function clickWatch(lead, ctl, t) {
     const name = steps[k].target.text ? `"${steps[k].target.text.slice(0, 40)}"` : "the last button";
     kick(ctl, { action: "again", k, id: prevId, why: `${name} (step ${k + 1}) didn't take: the page is the same and the button is still there` });
   }
+}
+
+// ---------- the referral code ----------
+// With a referral code set (options page; built in: VZWLQHE), before each
+// step TinyTab has the page put it in the sign-up form's referral field,
+// opening a closed "Referral code" section for it. A field that already
+// holds a code is left alone. The tape's own steps for that (opening the
+// section, typing the code) are skipped: they got stuck on closed sections.
+
+// Same words as REFERRAL in content/sense.js.
+const REFERRAL = /(refer|invit|promo(tion)?[\s_-]*code|推荐|邀请|招待|紹介|초대|추천|parrain|empfehl|referido|indica)/i;
+const referralTarget = (tg) => !!tg && REFERRAL.test([tg.text, ...["placeholder", "aria-label", "name", "id"].map((k) => (tg.attrs || {})[k])].join(" "));
+// A click on an icon or an empty box (the arrow that opens the section).
+const blankClick = (st) => st.type === "click" && st.target && !String(st.target.text || "").trim() && !["input", "textarea", "select"].includes(st.target.tag);
+
+// The tape's steps the referral fill does instead: steps on the referral
+// field or its "Referral code" line, and blank clicks just before typing it.
+// Also the field steps right after opening the "Referral code" line: that
+// field's own name may be only "Enter code".
+function referralSteps(steps) {
+  const out = new Set();
+  const onField = (st) => ["click", "input", "paste", "key"].includes(st.type) && st.target && ["input", "textarea"].includes(st.target.tag);
+  steps.forEach((st, k) => {
+    if (!["click", "input", "paste", "key"].includes(st.type) || !referralTarget(st.target)) return;
+    out.add(k);
+    if (st.type === "click" && !onField(st)) {
+      // The opener: the next steps on one field are the code going in.
+      let field = null;
+      for (let j = k + 1; j < steps.length && j - k <= 4 && (steps[j].tab || 0) === (st.tab || 0) && onField(steps[j]); j++) {
+        const key = targetKey(steps[j].target);
+        if (field && key !== field) break;
+        field = key;
+        out.add(j);
+      }
+    }
+    if (st.type !== "input" && st.type !== "paste") return;
+    for (let j = k - 1; j >= 0 && k - j <= 2 && (steps[j].tab || 0) === (st.tab || 0); j--) if (blankClick(steps[j])) out.add(j);
+  });
+  return out;
+}
+
+// Before a step in tab id: fill the referral field on this page. Asks the
+// page again on a new address, or while a sign-up form shows without the
+// field (it may draw later), a few times.
+async function ensureReferral(ctl, id) {
+  const code = aiConfig.referralCode;
+  if (!code) return;
+  const tab = await chrome.tabs.get(id).catch(() => null);
+  if (!tab) return;
+  const url = pageOf(tab.url) || tab.url;
+  const was = ctl.refs.get(id);
+  const same = was && was.url === url;
+  if (same && (was.state !== "none" || was.tries >= 6)) return;
+  const r = await sendWithTimeout(id, { type: "referral", code }, 3000).catch(() => null);
+  if (!r || !r.ok) return;
+  ctl.refs.set(id, { url, state: r.state, form: !!r.form, tries: same ? was.tries + 1 : 1 });
+  if (r.state === "done") log(`  Referral code ${code} filled in${r.opened ? ` (opened "${r.opened}")` : ""}`);
+  else if (r.state === "filled" && !same) log(`  Referral field already holds "${r.value}": left as it is`);
 }
 
 // Runs beside one playback until it ends: the code rule, every 2 s.
@@ -1728,6 +1786,8 @@ async function startPlayback(tabId, resumed, again = null) {
     codeTicking: false, // the countdown runs at codeMin or more
     aiGoal: new Map(), // step index -> went to the goal page for it
     aiAgain: new Map(), // step index -> clicks of the step before it, again (clickWatch)
+    refs: new Map(), // tabId -> { url, state, form, tries }: the referral fill on that page
+    refSkip: new Set(), // the tape's referral steps (the fill does them)
     steps: null, // the tape's steps, for goToGoal
     aiReloads: new Map(), // step index -> reloads the AI check asked for in this run
     over: false, // playback ended
@@ -1736,6 +1796,7 @@ async function startPlayback(tabId, resumed, again = null) {
 
   const t = getTab(tabId);
   ctl.steps = t.tape.steps;
+  if (aiConfig.referralCode) ctl.refSkip = referralSteps(t.tape.steps);
   aiWatch(tabId, ctl, t).catch((e) => log(`AI check stopped: ${(e && e.message) || e}`));
   clickWatch(tabId, ctl, t).catch((e) => log(`Click check stopped: ${(e && e.message) || e}`));
   if (t.tape.steps.some(isSendStep)) codeWatch(tabId, ctl, t).catch((e) => log(`Code rule stopped: ${(e && e.message) || e}`));
@@ -1982,6 +2043,14 @@ async function startPlayback(tabId, resumed, again = null) {
       for (let i = t.play.index; i < steps.length && !ctl.cancelled; i++) {
         const step = steps[i];
         const target = group[step.tab || 0] || tabId;
+        if (ctl.refSkip.has(i) && aiConfig.referralCode) {
+          // The referral fill does this step (see ensureReferral).
+          await ensureReferral(ctl, target);
+          log(`  Step ${i + 1} skipped: the referral code is filled in by TinyTab`);
+          t.play.index = i + 1;
+          sendGroup(tabId, { type: "done", index: i, run: t.play.run });
+          continue;
+        }
         if (step.type === "path" || strayAfterPaste(steps, i)) {
           // Mouse wiggles (path steps in older tapes) are not replayed. Tapes from
           // before 1.1.1 can hold a paste again as typing, which would type the
@@ -2045,6 +2114,7 @@ async function startPlayback(tabId, resumed, again = null) {
           await onKick(i, target);
           break;
         }
+        await ensureReferral(ctl, target);
         ctl.kick = null; // a verdict on an earlier step
         ctl.cur = { i, id: target, since: Date.now() };
         let res = await performStep(target, ctl, msg);

@@ -4,7 +4,7 @@ const PRESETS = self.AI_PROVIDERS; // ai-providers.js
 // A private build can carry a key (ai-builtin.js): then the check starts on.
 const BUILTIN = String(self.AI_BUILTIN_KEY || "").trim();
 const SERVICE = PRESETS[aiProviderOf(BUILTIN)];
-const DEFAULTS = { enabled: !!BUILTIN, baseUrl: SERVICE.baseUrl, model: SERVICE.model, apiKey: BUILTIN, every: 5, stuckAfter: 10, screenshot: SERVICE.screenshot, codeRule: true, codeMin: 65, goalLink: "8th Anniversary", goalButton: "Register", pageRule: true, allowedPages: "the sign-up page, the send-code (verification code) page, the 8th Anniversary page" };
+const DEFAULTS = { enabled: !!BUILTIN, baseUrl: SERVICE.baseUrl, model: SERVICE.model, apiKey: BUILTIN, every: 5, stuckAfter: 10, screenshot: SERVICE.screenshot, codeRule: true, codeMin: 65, goalLink: "8th Anniversary", goalButton: "Register", pageRule: true, referralCode: "VZWLQHE", allowedPages: "the sign-up page, the send-code (verification code) page, the 8th Anniversary page" };
 
 const $ = (id) => document.getElementById(id);
 const out = $("out");
@@ -33,6 +33,7 @@ function read() {
     goalLink: $("goalLink").value.trim(),
     goalButton: $("goalButton").value.trim(),
     pageRule: $("pageRule").checked,
+    referralCode: $("referralCode").value.trim(),
     allowedPages: $("allowedPages").value.trim(),
   };
 }
@@ -50,6 +51,7 @@ function fill(c) {
   $("goalLink").value = c.goalLink;
   $("goalButton").value = c.goalButton;
   $("pageRule").checked = c.pageRule !== false;
+  $("referralCode").value = c.referralCode == null ? DEFAULTS.referralCode : c.referralCode;
   $("allowedPages").value = c.allowedPages == null ? DEFAULTS.allowedPages : c.allowedPages;
   $("preset").value = presetOf(c);
 }

@@ -93,6 +93,9 @@
       case "snapshot":
         TT.sense.snapshot(msg.watch).then((snap) => reply({ ok: true, snap }), (e) => reply({ ok: false, error: String(e) }));
         return true;
+      case "referral":
+        TT.sense.referral(String(msg.code || "")).then((r) => reply({ ok: true, ...r }), () => reply({ ok: false }));
+        return true;
       case "codeTimer":
         reply({ ok: true, ...TT.sense.codeTimer() });
         return;

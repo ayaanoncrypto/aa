@@ -273,6 +273,77 @@
     return { done: true, label };
   }
 
+  // ---------- the referral code (background.js: ensureReferral) ----------
+
+  // Referral / invite code fields, in the languages sign-up forms use most.
+  // Same words as REFERRAL in background.js.
+  const REFERRAL = /(refer|invit|promo(tion)?[\s_-]*code|推荐|邀请|招待|紹介|초대|추천|parrain|empfehl|referido|indica)/i;
+  const nearText = (el) => {
+    for (let n = el.parentElement, d = 0; n && d < 2; n = n.parentElement, d++) {
+      if (n.textContent && n.textContent.length <= 80) return n.textContent;
+    }
+    return "";
+  };
+  const fieldWords = (el) => [el.getAttribute("placeholder"), el.getAttribute("aria-label"), el.name, el.id, el.labels && el.labels[0] ? el.labels[0].textContent : "", nearText(el)].join(" ");
+  function referralFields(root = document) {
+    return Array.from(root.querySelectorAll('input:not([type]), input[type="text"], input[type="search"], input[type="tel"], input[type="number"]')).filter((el) => !TT.HOST_TAGS.has(el.localName) && REFERRAL.test(fieldWords(el)));
+  }
+  // The sign-up form: the box around the email or password field holding 2+ fields.
+  function signUpForm() {
+    const key = document.querySelector('input[type="password"], input[type="email"], input[autocomplete="email"], input[autocomplete="username"]');
+    if (!key) return null;
+    let n = key.parentElement;
+    for (let d = 0; n && d < 8; d++, n = n.parentElement) {
+      if (n.localName === "form" || n.querySelectorAll("input").length >= 2) return n;
+    }
+    return key.form || null;
+  }
+  // The "Referral code (optional)" line that opens the field, inside the form only
+  // (a "Referral program" link in the site's menu goes elsewhere).
+  function referralOpener(form) {
+    let best = null;
+    for (const el of form.querySelectorAll('button, a, [role="button"], label, span, div, p')) {
+      const text = el.textContent || "";
+      if (text.length > 60 || !REFERRAL.test(text) || el.querySelector("input") || !TT.isVisible(el)) continue;
+      if (el.localName === "a" && /^(https?:|\/)/i.test(el.getAttribute("href") || "")) continue;
+      if (!best || best.contains(el)) best = el; // the innermost
+    }
+    return best;
+  }
+  function fillField(el, value) {
+    el.focus();
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, "value").set.call(el, value); // frameworks see it (React)
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    el.blur();
+  }
+  // Puts code in the sign-up form's referral field, opening its section when
+  // closed. Leaves a field that already holds a code alone.
+  //   state: "done" (filled in now), "filled" (had one), "none" (no field);
+  //   form: whether the page has a sign-up form (worth another look later).
+  async function referral(code) {
+    const form = signUpForm();
+    let el = referralFields().find(TT.isVisible);
+    if (!el && !form) return { state: "none", form: false };
+    let opened = "";
+    if (!el && form) {
+      const opener = referralOpener(form);
+      if (opener) {
+        opened = clean(opener.textContent).slice(0, 60);
+        TT.player.press(opener);
+        for (let k = 0; k < 10 && !el; k++) {
+          await sleep(100);
+          el = referralFields().find(TT.isVisible);
+        }
+      }
+    }
+    if (!el) return { state: "none", form: true, opened };
+    if (clean(el.value)) return { state: "filled", value: clean(el.value).slice(0, 40) };
+    fillField(el, code);
+    return { state: "done", opened };
+  }
+
   // The page in words: address without the query, title, the start of its
   // text, and the names of what is on screen. Never what is typed in a field.
   // watch: how long to look for changes, in ms (0: don't).
@@ -303,5 +374,5 @@
     return snap;
   }
 
-  TT.sense = { signOut, unblock, signOutControls, menuOpeners, SIGN_OUT, snapshot, codeTimer, clickText };
+  TT.sense = { signOut, unblock, signOutControls, menuOpeners, SIGN_OUT, snapshot, codeTimer, clickText, referral };
 })();

@@ -28,6 +28,7 @@ const AI_DEFAULTS = {
   // On a page the tape doesn't visit near this step, and the AI says it's
   // none of these: log out and start again.
   pageRule: true,
+  referralCode: "VZWLQHE", // put in every empty referral field of a sign-up form; "" for off
   allowedPages: "the sign-up page, the send-code (verification code) page, the 8th Anniversary page",
 };
 const AI_PAGES = ["expected", "start", "home", "login", "error", "blank", "loading", "other"];
@@ -57,6 +58,7 @@ function cleanAiConfig(raw) {
   c.goalLink = String(c.goalLink == null ? AI_DEFAULTS.goalLink : c.goalLink).trim().slice(0, 80);
   c.goalButton = String(c.goalButton == null ? AI_DEFAULTS.goalButton : c.goalButton).trim().slice(0, 80);
   c.pageRule = c.pageRule !== false;
+  c.referralCode = String(c.referralCode == null ? AI_DEFAULTS.referralCode : c.referralCode).trim().slice(0, 60);
   c.allowedPages = String(c.allowedPages == null ? AI_DEFAULTS.allowedPages : c.allowedPages).trim().slice(0, 300);
   return c;
 }
