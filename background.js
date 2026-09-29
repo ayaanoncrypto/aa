@@ -112,7 +112,17 @@ const ready = (async () => {
   // step 1, same run. Mid-run, the copied text and the pages' state are gone.
   for (const [id, t] of tabs) {
     if (t.mode === "playing" && t.link == null) {
-      log(`TinyTab's worker was restarted by Chrome during run ${t.play.run} (at step ${t.play.index + 1}). Playing again from step 1.`);
+      // Past the sign-up (8th Anniversary, Register Now, log out): go on from
+      // there, or that account never gets to Register Now (the start of a new
+      // run logs a signed-in account out). Before it: from step 1.
+      const i = t.play.index;
+      const gs = goalStep(t.tape.steps);
+      if (gs >= 0 && !goalAtStart(t.tape.steps) && i >= gs - 1 && i < t.tape.steps.length) {
+        log(`TinyTab's worker was restarted by Chrome during run ${t.play.run} (at step ${i + 1}, past the sign-up). Going on from there.`);
+        startPlayback(id, true);
+        continue;
+      }
+      log(`TinyTab's worker was restarted by Chrome during run ${t.play.run} (at step ${i + 1}). Playing again from step 1.`);
       t.play.index = 0;
       startPlayback(id, false, { group: t.group });
     }
@@ -2095,6 +2105,15 @@ async function startPlayback(tabId, resumed, again = null) {
 
     if (resumed) await waitReady(tabId, 5000, ctl);
     const steps = t.tape.steps;
+    if (resumed && t.play.index > 0 && t.play.index < steps.length) {
+      // The saved place can be a step behind (saved once a second): take the
+      // step that fits the page now.
+      const k = await findPlace(steps, t.play.index, group[steps[t.play.index].tab || 0] || tabId, ctl);
+      if (k >= 0 && k !== t.play.index) {
+        log(`  Resumed at step ${k + 1}, where the page is`);
+        t.play.index = k;
+      }
+    }
     const runs = () => (t.settings.loop ? Infinity : Math.max(1, t.settings.repeat | 0));
     const last = new Map(); // tabId -> cursor position
     const hidden = new Map(); // tabId -> last known hidden state
