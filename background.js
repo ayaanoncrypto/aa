@@ -1198,8 +1198,10 @@ async function signOutFirst(lead, ctl, t, group, steps, only = null) {
   let pressed = false;
   const once = (id, k) =>
     performStepOnce(id, ctl, { type: "perform", i: k, step: steps[k], lead: 0, speed: "max", patient: false, from: null, clip: null, settings: t.settings });
-  const probe = async (id, ks) => {
-    const r = await sendWithTimeout(id, { type: "probe", targets: ks.map((k) => steps[k].target), sure: ks.map(() => true) }, 5000).catch(() => null);
+  // sure: only a clear match counts. Menu openers are often a bare icon
+  // ("svg"), which only its recorded spot tells apart: probed loosely.
+  const probe = async (id, ks, sure = true) => {
+    const r = await sendWithTimeout(id, { type: "probe", targets: ks.map((k) => steps[k].target), sure: ks.map(() => sure) }, 5000).catch(() => null);
     const n = r && Array.isArray(r.found) ? r.found.findIndex(Boolean) : -1;
     return n < 0 ? -1 : ks[n];
   };
@@ -1221,7 +1223,10 @@ async function signOutFirst(lead, ctl, t, group, steps, only = null) {
           if ((steps[j].type === "click" || steps[j].type === "dbl") && steps[j].target && !openers.includes(j)) openers.push(j);
         }
       }
-      const opener = openers.length ? await probe(id, openers) : -1;
+      // Nearest first: the click right before Log Out opens its menu. An
+      // earlier one (a banner, Register Now) would leave the page.
+      let opener = -1;
+      for (const j of openers) if ((opener = await probe(id, [j], false)) >= 0) break;
       if (opener < 0) continue;
       say(lead, "Opening the menu to log out");
       await once(id, opener);
